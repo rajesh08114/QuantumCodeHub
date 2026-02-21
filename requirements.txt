@@ -1,0 +1,42 @@
+# Python dependencies for backend.
+
+# Core framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+
+# Database and cache
+asyncpg==0.29.0
+redis==5.0.1
+
+# Authentication
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==5.0.0
+email-validator==2.3.0
+
+# AI/ML and RAG
+requests==2.32.5
+chromadb==1.5.0
+sentence-transformers==5.2.2
+transformers==4.57.6
+torch==2.10.0
+langchain==1.2.10
+langchain-core==1.2.12
+langchain-community==0.4.1
+langchain-huggingface==1.2.0
+langchain-ollama==1.0.1
+
+# Utilities
+python-dotenv==1.0.0
+pydantic==2.12.5
+pydantic-settings==2.12.0
+
+# Monitoring
+prometheus-client==0.19.0
+sentry-sdk[fastapi]==1.39.1
+
+# Testing
+pytest==7.4.3
+pytest-asyncio==0.21.1
+httpx==0.28.1

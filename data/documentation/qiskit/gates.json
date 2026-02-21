@@ -1,0 +1,20 @@
+[
+  {
+    "content": "The Hadamard gate (H) creates superposition. It maps |0\u27e9 to (|0\u27e9 + |1\u27e9)/\u221a2 and |1\u27e9 to (|0\u27e9 - |1\u27e9)/\u221a2. In Qiskit: qc.h(qubit_index)",
+    "source": "gates_reference",
+    "section": "single_qubit_gates",
+    "version": "1.0"
+  },
+  {
+    "content": "CNOT gate (CX) is a two-qubit gate that flips the target qubit if control qubit is |1\u27e9. In Qiskit: qc.cx(control_qubit, target_qubit)",
+    "source": "gates_reference",
+    "section": "two_qubit_gates",
+    "version": "1.0"
+  },
+  {
+    "content": "To create a QuantumCircuit in Qiskit: from qiskit import QuantumCircuit; qc = QuantumCircuit(num_qubits). You can also specify classical bits: qc = QuantumCircuit(num_qubits, num_classical_bits)",
+    "source": "circuit_basics",
+    "section": "circuit_creation",
+    "version": "1.0"
+  }
+]
