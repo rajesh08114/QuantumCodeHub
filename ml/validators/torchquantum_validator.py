@@ -1,5 +1,5 @@
 """
-Cirq validator.
+TorchQuantum validator.
 """
 import ast
 from typing import Dict, List, Optional, Tuple
@@ -7,13 +7,12 @@ from typing import Dict, List, Optional, Tuple
 from ml.validators.base_validator import BaseValidator
 
 
-class _CirqAnalyzer(ast.NodeVisitor):
+class _TorchQuantumAnalyzer(ast.NodeVisitor):
     def __init__(self):
         self.constants: Dict[str, int] = {}
-        self.collections: Dict[str, int] = {}
+        self.devices: Dict[str, int] = {}
         self.loop_bounds_stack: List[Dict[str, Tuple[int, int]]] = []
         self.errors: List[str] = []
-        self.has_circuit = False
 
     @staticmethod
     def _call_name(node: ast.AST) -> str:
@@ -49,17 +48,28 @@ class _CirqAnalyzer(ast.NodeVisitor):
             return (start, start)
         return (start, stop - 1)
 
-    def _resolve_index(self, node: ast.AST) -> Optional[int]:
+    def _resolve_wire_indices(self, node: ast.AST) -> List[int]:
         if isinstance(node, ast.Constant) and isinstance(node.value, int):
-            return int(node.value)
+            return [int(node.value)]
         if isinstance(node, ast.Name):
             const = self.constants.get(node.id)
             if const is not None:
-                return const
+                return [const]
             for frame in reversed(self.loop_bounds_stack):
                 if node.id in frame:
-                    return frame[node.id][1]
-        return None
+                    return [frame[node.id][1]]
+            return []
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            values: List[int] = []
+            for item in node.elts:
+                values.extend(self._resolve_wire_indices(item))
+            return values
+        return []
+
+    def _wire_budget(self) -> Optional[int]:
+        if not self.devices:
+            return None
+        return max(self.devices.values())
 
     def visit_Assign(self, node: ast.Assign):
         for target in node.targets:
@@ -70,23 +80,17 @@ class _CirqAnalyzer(ast.NodeVisitor):
             if resolved is not None:
                 self.constants[name] = resolved
                 continue
-
             if isinstance(node.value, ast.Call):
-                call_name = self._call_name(node.value.func)
-                if call_name == "Circuit":
-                    self.has_circuit = True
-                if call_name == "range" and isinstance(node.value.func, ast.Attribute):
-                    owner = self._call_name(node.value.func.value).lower()
-                    if owner == "linequbit" and node.value.args:
-                        count = self._resolve_int(node.value.args[0])
-                        if count is not None and count > 0:
-                            self.collections[name] = count
-                    elif owner == "gridqubit" and len(node.value.args) >= 2:
-                        rows = self._resolve_int(node.value.args[0])
-                        cols = self._resolve_int(node.value.args[1])
-                        if rows and cols and rows > 0 and cols > 0:
-                            self.collections[name] = rows * cols
-
+                constructor = self._call_name(node.value.func)
+                if constructor in {"QuantumDevice", "QuantumModuleFromOps"}:
+                    wires = None
+                    for keyword in node.value.keywords or []:
+                        if keyword.arg in {"n_wires", "wires"}:
+                            wires = self._resolve_int(keyword.value)
+                    if wires is None and node.value.args:
+                        wires = self._resolve_int(node.value.args[0])
+                    if wires is not None and wires > 0:
+                        self.devices[name] = wires
         self.generic_visit(node)
 
     def visit_For(self, node: ast.For):
@@ -100,43 +104,35 @@ class _CirqAnalyzer(ast.NodeVisitor):
         if pushed:
             self.loop_bounds_stack.pop()
 
-    def visit_Subscript(self, node: ast.Subscript):
-        if isinstance(node.value, ast.Name):
-            collection_size = self.collections.get(node.value.id)
-            if collection_size is not None:
-                target = node.slice
-                if isinstance(target, ast.Index):  # pragma: no cover - py<3.9 compat
-                    target = target.value
-                index = self._resolve_index(target)
-                if index is not None and (index < 0 or index >= collection_size):
-                    self.errors.append(
-                        f"Cirq qubit index {index} out of range for '{node.value.id}' size {collection_size} "
-                        f"(line {getattr(node, 'lineno', 0)})"
-                    )
+    def visit_Call(self, node: ast.Call):
+        wire_budget = self._wire_budget()
+        if wire_budget is not None:
+            for keyword in node.keywords or []:
+                if keyword.arg == "wires":
+                    indices = self._resolve_wire_indices(keyword.value)
+                    for index in indices:
+                        if index < 0 or index >= wire_budget:
+                            self.errors.append(
+                                f"TorchQuantum wire index {index} out of range for n_wires={wire_budget} "
+                                f"(line {getattr(node, 'lineno', 0)})"
+                            )
         self.generic_visit(node)
 
 
-class CirqValidator(BaseValidator):
+class TorchQuantumValidator(BaseValidator):
     def __init__(self):
-        super().__init__("cirq")
+        super().__init__("torchquantum")
 
     def _get_required_imports(self) -> list:
-        return ["cirq"]
+        return ["torchquantum"]
 
     def _validate_framework_specific(self, code: str):
-        deprecated = {
-            "Xmon": "Xmon APIs are deprecated; use modern Cirq simulators/devices.",
-        }
-        for token, message in deprecated.items():
-            if token in code:
-                self.warnings.append(f"Deprecated: {message}")
-
         try:
             tree = ast.parse(code)
-            analyzer = _CirqAnalyzer()
+            analyzer = _TorchQuantumAnalyzer()
             analyzer.visit(tree)
             self.errors.extend(analyzer.errors)
-            if not analyzer.has_circuit:
-                self.warnings.append("No cirq.Circuit() construction detected.")
+            if not analyzer.devices:
+                self.warnings.append("No QuantumDevice(...) detected; wire-size checks are limited.")
         except SyntaxError:
             return

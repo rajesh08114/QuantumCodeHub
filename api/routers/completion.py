@@ -5,10 +5,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from typing import List, Optional
 
-from schemas.common import ClientContext
+from schemas.common import ClientContext, RuntimePreferences
 from services.llm_service import llm_service
 from services.rag_service import rag_service
-from services.runtime_compatibility import build_runtime_bundle
+from services.runtime_compatibility import build_runtime_bundle_with_rag
 from ml.prompts import CompletionPrompts
 from core.config import settings
 from core.security import get_current_active_user
@@ -28,6 +28,10 @@ class CompletionRequest(BaseModel):
     client_context: Optional[ClientContext] = Field(
         None,
         description="Client metadata for version-aware completion suggestions.",
+    )
+    runtime_preferences: Optional[RuntimePreferences] = Field(
+        None,
+        description="Optional explicit runtime target for version-aware completion.",
     )
 
 
@@ -61,9 +65,11 @@ async def get_completions(
 
     try:
         framework = _normalize_framework_name(request.framework)
-        runtime_bundle = build_runtime_bundle(
+        runtime_bundle = await build_runtime_bundle_with_rag(
             framework=framework,
             client_context=request.client_context,
+            runtime_preferences=request.runtime_preferences,
+            request_source="/api/complete/suggest",
         )
         code_prefix = (request.code_prefix or "").rstrip()
         max_suggestions = max(1, min(request.max_suggestions, 10))
@@ -142,8 +148,11 @@ async def get_completions(
                 "llm_fallback_used": llm_response.get("fallback_used", False),
                 "client_type": runtime_bundle["client_type"],
                 "client_context": runtime_bundle["client_context"],
+                "requested_runtime": runtime_bundle.get("requested_runtime", {}),
+                "runtime_requirements": runtime_bundle.get("effective_runtime_target", {}),
                 "runtime_recommendations": runtime_bundle["runtime_recommendations"],
                 "version_conflicts": runtime_bundle["version_conflicts"],
+                "runtime_validation": runtime_bundle["runtime_validation"],
             },
         }
 

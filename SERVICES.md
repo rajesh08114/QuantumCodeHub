@@ -8,7 +8,7 @@ This file explains how the backend works internally and how to control behavior 
   - Ordered fallback provider execution.
   - LangChain message + runnable orchestration.
   - LangChain `ChatOllama` path with HTTP fallback.
-  - Default chain: `hf_api -> resp_api -> ollama -> hf_qwen_api`.
+  - Provider chain is environment-configurable (commonly `hf_qwen_api`).
 - `services/rag_service.py`
   - Chroma retrieval with multi-query + hybrid reranking + diversity constraints.
 - `services/runtime_compatibility.py`
@@ -19,6 +19,15 @@ This file explains how the backend works internally and how to control behavior 
     - runtime recommendations
     - conflict warnings
     - cache fingerprint
+- `services/code_evaluation_service.py`
+  - LLM + RAG-assisted evaluator for non-rule-based validation.
+  - Signal-aware contradiction filtering to suppress false warnings.
+  - Hallucination guard that keeps warnings/issues only when grounded in code or RAG evidence.
+- `services/modernization_service.py`
+  - Cross-framework deprecated API rewrite pass.
+  - Applies only when validation quality improves.
+- `services/adaptive_routing_service.py`
+  - RL-inspired epsilon-greedy provider routing with EMA reward updates.
 - `services/transpiler_service.py`
   - Framework conversion generation.
 - `services/chat_memory_service.py`
@@ -38,16 +47,29 @@ Routers accept optional `client_context`:
 - `installed_packages`
 - extension metadata (for VS Code)
 
+Routers that generate/transform code also accept optional `runtime_preferences`:
+- `mode` (`auto`, `modern`, `legacy`)
+- `python_version`
+- `framework_version`
+- `package_versions`
+- `allow_deprecated_apis`
+
 ### 2.2 Processing
-`build_runtime_bundle()`:
+`build_runtime_bundle_with_rag()`:
 1. Normalizes client type.
-2. Loads framework support matrix from `core/config.py`.
-3. Compares installed package majors to supported ranges.
-4. Produces:
+2. Normalizes user-requested runtime preferences.
+3. Retrieves version-related docs from RAG.
+4. Uses LLM to synthesize structured runtime recommendations from retrieved docs.
+5. Validates suggested versions against retrieved docs (token-overlap evidence check).
+6. Merges requested runtime with validated recommendations into effective runtime target.
+7. Produces:
    - `compatibility_context` for prompts
    - `rag_query_suffix` for retrieval
-   - `runtime_recommendations` for response metadata
+   - `requested_runtime`
+   - `effective_runtime_target`
+   - `runtime_recommendations` for response metadata (effective target used by generation)
    - `version_conflicts`
+   - `runtime_validation`
    - `cache_fingerprint` for compatibility-safe cache keys
 
 ### 2.3 Router Coverage
@@ -107,18 +129,14 @@ Config:
 Compatibility-aware retrieval:
 - `rag_query_suffix` is appended so retrieval includes version constraints.
 
-## 7. Runtime Support Matrix Controls
+## 7. Runtime Recommendation Controls
 
-Config keys:
-- `SUPPORTED_PYTHON_VERSION`
-- `SUPPORTED_QISKIT_VERSION`
-- `SUPPORTED_QISKIT_AER_VERSION`
-- `SUPPORTED_PENNYLANE_VERSION`
-- `SUPPORTED_CIRQ_VERSION`
-- `SUPPORTED_TORCHQUANTUM_VERSION`
-- `SUPPORTED_TORCH_VERSION`
+Runtime recommendations are now derived from retrieved documentation plus LLM synthesis, then validated against those docs.
 
-Update these when your supported runtime baseline changes.
+Operational notes:
+- If RAG has weak or missing version docs, `runtime_recommendations` may be empty.
+- `runtime_validation.status` explains whether recommendations were validated.
+- Conflict checks run only on validated version suggestions.
 
 ## 8. Token Controls
 
@@ -135,7 +153,51 @@ Guideline:
 - balanced: `512-900`
 - best quality: `1200-2200`
 
-## 9. Chat Memory Controls
+## 9. Validation + Modernization Controls
+
+Validation controls:
+- `VALIDATION_MODE`
+- `VALIDATION_ENABLE_LLM_EVAL`
+- `VALIDATION_LLM_MAX_TOKENS`
+- `VALIDATION_LLM_ON_STATIC_PASS_ONLY`
+- `VALIDATION_MAX_CODE_CHARS`
+- `VALIDATION_MAX_RAG_CHARS`
+- `VALIDATION_MAX_COMPATIBILITY_CHARS`
+- `VALIDATION_USE_RAG`
+- `VALIDATION_RAG_TOP_K`
+- `VALIDATION_RAG_AUGMENT_WHEN_CONTEXT_PRESENT`
+- `VALIDATION_FAIL_ON_LLM_CRITICAL`
+- `VALIDATION_REQUIRE_LLM_PASS`
+- `VALIDATION_HALLUCINATION_GUARD_ENABLED`
+- `VALIDATION_HALLUCINATION_MIN_CODE_OVERLAP`
+- `VALIDATION_HALLUCINATION_MIN_RAG_OVERLAP`
+- `VALIDATION_HALLUCINATION_MAX_DROPPED_REPORT`
+
+Modernization controls:
+- `ENABLE_MODERNIZATION_REPAIR`
+- `MODERNIZATION_ON_DEPRECATION`
+- `MODERNIZATION_STRICT`
+- `MODERNIZATION_MAX_TOKENS`
+- `MODERNIZATION_APPLY_ON_GENERATE`
+- `MODERNIZATION_APPLY_ON_TRANSPILE`
+- `MODERNIZATION_APPLY_ON_FIX`
+
+Endpoint behavior:
+- Generate/transpile/fix routes validate output.
+- If deprecated APIs are detected, modernization rewrite is attempted.
+- If `runtime_preferences.mode=legacy` or `allow_deprecated_apis=true`, modernization rewrite is skipped.
+- Rewritten code is revalidated before acceptance.
+
+## 10. Adaptive Routing Controls
+
+- `ENABLE_ADAPTIVE_ROUTING`
+- `ADAPTIVE_ROUTING_EPSILON`
+- `ADAPTIVE_ROUTING_ALPHA`
+- `ADAPTIVE_ROUTING_TARGET_LATENCY_MS`
+
+Reward blend uses validation pass + confidence + latency.
+
+## 11. Chat Memory Controls
 
 - `CHAT_ENABLE_SESSION_MEMORY`
 - `CHAT_CONTEXT_MESSAGES`
@@ -147,7 +209,7 @@ Guideline:
 
 When auth is disabled (`ENABLE_AUTH=false`), persistent memory is effectively unavailable because user id is absent.
 
-## 10. Logging Controls
+## 12. Logging Controls
 
 - `LOG_LEVEL`
 - `LOG_HTTP_REQUEST_BODY`
@@ -162,7 +224,7 @@ Logs include:
 - RAG retrieval plan/results
 - quota/rate-limit decisions
 
-## 11. Cleanup Performed
+## 13. Cleanup Performed
 
 Unused code cleanup included:
 - removed unused `UserLogin` model in `api/routers/auth.py`

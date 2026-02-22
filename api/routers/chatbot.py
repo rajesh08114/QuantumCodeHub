@@ -15,8 +15,8 @@ from ml.prompts import ChatbotPrompts
 from services.chat_memory_service import chat_memory_service
 from services.llm_service import llm_service
 from services.rag_service import rag_service
-from services.runtime_compatibility import build_runtime_bundle
-from schemas.common import ClientContext
+from services.runtime_compatibility import build_runtime_bundle_with_rag
+from schemas.common import ClientContext, RuntimePreferences
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/chat", tags=["Chatbot"])
@@ -48,6 +48,10 @@ class ChatRequest(BaseModel):
     client_context: Optional[ClientContext] = Field(
         None,
         description="Client metadata for version-aware retrieval/generation.",
+    )
+    runtime_preferences: Optional[RuntimePreferences] = Field(
+        None,
+        description="Optional explicit runtime target for version-aware chat code answers.",
     )
 
 
@@ -157,9 +161,11 @@ async def chat_message(
         runtime_framework = detected_framework if detected_framework in VALID_FRAMEWORKS else "qiskit"
         math_focus = _is_math_focused_query(query, request.detail_level)
 
-        runtime_bundle = build_runtime_bundle(
+        runtime_bundle = await build_runtime_bundle_with_rag(
             framework=runtime_framework,
             client_context=request.client_context,
+            runtime_preferences=request.runtime_preferences,
+            request_source="/api/chat/message",
         )
 
         # Session memory bootstrap.
@@ -300,8 +306,11 @@ async def chat_message(
                 "llm_model": llm.get("model"),
                 "llm_attempt": llm.get("attempt"),
                 "llm_fallback_used": llm.get("fallback_used", False),
+                "requested_runtime": runtime_bundle.get("requested_runtime", {}),
+                "runtime_requirements": runtime_bundle.get("effective_runtime_target", {}),
                 "runtime_recommendations": runtime_bundle["runtime_recommendations"],
                 "version_conflicts": runtime_bundle["version_conflicts"],
+                "runtime_validation": runtime_bundle["runtime_validation"],
                 "latency_ms": int((time.time() - start) * 1000),
             },
         }

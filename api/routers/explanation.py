@@ -5,10 +5,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional
 
-from schemas.common import ClientContext
+from schemas.common import ClientContext, RuntimePreferences
 from services.llm_service import llm_service
 from services.rag_service import rag_service
-from services.runtime_compatibility import build_runtime_bundle
+from services.runtime_compatibility import build_runtime_bundle_with_rag
 from ml.prompts import ExplanationPrompts
 from core.config import settings
 from core.security import get_current_active_user
@@ -28,6 +28,10 @@ class ExplanationRequest(BaseModel):
         None,
         description="Client metadata for version-aware explanations.",
     )
+    runtime_preferences: Optional[RuntimePreferences] = Field(
+        None,
+        description="Optional explicit runtime target for explanation context.",
+    )
 
 class ExplanationResponse(BaseModel):
     overview: str
@@ -36,7 +40,10 @@ class ExplanationResponse(BaseModel):
     mathematics: Optional[str] = None
     applications: str
     visualization: Optional[str] = None
+    requested_runtime: Optional[dict] = None
+    runtime_requirements: Optional[dict] = None
     runtime_recommendations: Optional[dict] = None
+    runtime_validation: Optional[dict] = None
 
 @router.post("/code", response_model=ExplanationResponse)
 async def explain_code(
@@ -64,9 +71,11 @@ async def explain_code(
     ```
     """
     try:
-        runtime_bundle = build_runtime_bundle(
+        runtime_bundle = await build_runtime_bundle_with_rag(
             framework=request.framework,
             client_context=request.client_context,
+            runtime_preferences=request.runtime_preferences,
+            request_source="/api/explain/code",
         )
 
         # Get relevant documentation for context
@@ -110,7 +119,10 @@ async def explain_code(
         if request.include_math:
             explanation["mathematics"] = extract_mathematics(llm_response["generated_text"])
 
+        explanation["requested_runtime"] = runtime_bundle.get("requested_runtime", {})
+        explanation["runtime_requirements"] = runtime_bundle.get("effective_runtime_target", {})
         explanation["runtime_recommendations"] = runtime_bundle["runtime_recommendations"]
+        explanation["runtime_validation"] = runtime_bundle["runtime_validation"]
         
         return explanation
         

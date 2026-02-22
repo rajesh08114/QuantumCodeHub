@@ -19,16 +19,21 @@ class CodeGenerationPrompts:
         system_messages = {
             "qiskit": """You are a senior quantum software engineer specializing in IBM Qiskit.
 Produce accurate, runnable Python code with modern Qiskit APIs.
-Never output placeholders or pseudo-code.""",
+Never output placeholders or pseudo-code.
+For simulation, do not use execute() or Aer.get_backend('qasm_simulator').
+Prefer AerSimulator + transpile() + backend.run().""",
             "pennylane": """You are a senior quantum software engineer specializing in PennyLane.
 Produce accurate, runnable Python code with valid device + QNode usage.
-Never output placeholders or pseudo-code.""",
+Never output placeholders or pseudo-code.
+Use stable, non-deprecated PennyLane APIs and modern measurement returns.""",
             "cirq": """You are a senior quantum software engineer specializing in Cirq.
 Produce accurate, runnable Python code with modern Cirq idioms.
-Never output placeholders or pseudo-code.""",
+Never output placeholders or pseudo-code.
+Avoid deprecated/legacy Cirq APIs and prefer currently stable simulator/runtime patterns.""",
             "torchquantum": """You are a senior quantum ML engineer specializing in TorchQuantum.
 Produce accurate, runnable hybrid quantum-classical PyTorch code.
-Never output placeholders or pseudo-code.""",
+Never output placeholders or pseudo-code.
+Use stable, non-deprecated TorchQuantum + PyTorch APIs.""",
         }
         return system_messages.get(framework, system_messages["qiskit"])
 
@@ -38,6 +43,7 @@ Never output placeholders or pseudo-code.""",
         framework: str,
         rag_context: str,
         num_qubits: int = None,
+        include_explanation: bool = False,
         conversation_context: str = "",
         compatibility_context: str = "",
     ) -> str:
@@ -47,7 +53,7 @@ Never output placeholders or pseudo-code.""",
         memory_block = _optional_block("Conversation memory", conversation_context)
         compatibility_block = _optional_block("Runtime compatibility context", compatibility_context)
 
-        return f"""Task: Generate production-ready {framework} quantum code.
+        prompt = f"""Task: Generate production-ready {framework} quantum code.
 
 User request:
 {user_query}
@@ -67,17 +73,20 @@ Requirements:
 5. Include measurement/output steps when relevant.
 6. Avoid markdown outside requested output format.
 7. Avoid deprecated APIs and keep package usage version-compatible.
+8. Ensure all qubit indices are valid for the declared circuit size.
+9. If a loop applies gates across qubits, keep loop bounds within circuit size.
 
 Output format (strict):
 ```python
 # complete {framework} solution
 ```
+"""
+        if include_explanation:
+            prompt += """
 Explanation:
 - 2-4 concise bullet points describing approach and key quantum operations.
-Runtime Recommendations:
-- Python: <supported version>
-- Packages: <framework + critical dependencies with versions>
 """
+        return prompt
 
 
 class TranspilationPrompts:

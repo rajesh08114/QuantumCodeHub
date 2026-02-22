@@ -5,11 +5,14 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from typing import List, Optional
 
-from schemas.common import ClientContext
+from schemas.common import ClientContext, RuntimePreferences
 from services.transpiler_service import transpiler_service
 from services.cache_service import cache_service
-from services.runtime_compatibility import build_runtime_bundle
+from services.validator_service import validator_service
+from services.modernization_service import modernization_service
+from services.runtime_compatibility import build_runtime_bundle_with_rag
 from core.security import get_current_active_user
+from core.config import settings
 import time
 import hashlib
 import logging
@@ -27,6 +30,10 @@ class TranspilationRequest(BaseModel):
     client_context: Optional[ClientContext] = Field(
         None,
         description="Client metadata for version-aware transpilation.",
+    )
+    runtime_preferences: Optional[RuntimePreferences] = Field(
+        None,
+        description="Optional explicit runtime target (legacy/modern/version-specific).",
     )
 
 class TranspilationResponse(BaseModel):
@@ -72,9 +79,11 @@ async def transpile_code(
         source_framework = _normalize_framework_name(request.source_framework)
         target_framework = _normalize_framework_name(request.target_framework)
         source_code = _clean_source_code(request.source_code)
-        runtime_bundle = build_runtime_bundle(
+        runtime_bundle = await build_runtime_bundle_with_rag(
             framework=target_framework,
             client_context=request.client_context,
+            runtime_preferences=request.runtime_preferences,
+            request_source="/api/transpile/convert",
         )
 
         # Only required-field checks (no pre-syntax validation)
@@ -120,15 +129,48 @@ async def transpile_code(
                 },
             )
 
+        validation_result = await validator_service.validate(
+            code=transpilation_result["code"],
+            framework=target_framework,
+            user_query=(
+                f"Transpile {source_framework} to {target_framework} while preserving behavior."
+            ),
+            compatibility_context=runtime_bundle["compatibility_context"],
+        )
+
+        modernization_result = {
+            "attempted": False,
+            "applied": False,
+            "reason": "disabled",
+            "before_deprecation_count": 0,
+            "after_deprecation_count": 0,
+            "llm_provider": None,
+            "llm_model": None,
+            "tokens_used": 0,
+        }
+        if settings.MODERNIZATION_APPLY_ON_TRANSPILE:
+            modernization_result = await modernization_service.maybe_modernize(
+                framework=target_framework,
+                code=transpilation_result["code"],
+                validation_result=validation_result,
+                user_query=(
+                    f"Transpile {source_framework} to {target_framework} while preserving behavior."
+                ),
+                compatibility_context=runtime_bundle["compatibility_context"],
+                runtime_preferences=runtime_bundle.get("requested_runtime"),
+            )
+            if modernization_result.get("applied"):
+                transpilation_result["code"] = modernization_result["code"]
+                validation_result = modernization_result["validation_result"]
+
         response = {
             "transpiled_code": transpilation_result["code"],
             "source_framework": source_framework,
             "target_framework": target_framework,
             "success": transpilation_result["success"],
-            # pre-validation is disabled by request; mark as not-run
-            "validation_passed": True,
+            "validation_passed": bool(validation_result.get("passed", False)),
             "differences": transpilation_result.get("differences", []),
-            "warnings": transpilation_result.get("warnings", []),
+            "warnings": transpilation_result.get("warnings", []) + validation_result.get("warnings", []),
             "metadata": {
                 "latency_ms": int((time.time() - start_time) * 1000),
                 "method": transpilation_result.get("method", "llm"),
@@ -138,11 +180,23 @@ async def transpile_code(
                 "llm_attempt": transpilation_result.get("llm_attempt"),
                 "llm_fallback_used": transpilation_result.get("llm_fallback_used", False),
                 "cached": False,
-                "pre_validation": "disabled",
+                "validation_errors": validation_result.get("errors", []),
+                "validation_evaluation": validation_result.get("evaluation", {}),
+                "modernization_attempted": modernization_result.get("attempted", False),
+                "modernization_applied": modernization_result.get("applied", False),
+                "modernization_reason": modernization_result.get("reason"),
+                "modernization_before_deprecations": modernization_result.get("before_deprecation_count", 0),
+                "modernization_after_deprecations": modernization_result.get("after_deprecation_count", 0),
+                "modernization_llm_provider": modernization_result.get("llm_provider"),
+                "modernization_llm_model": modernization_result.get("llm_model"),
+                "modernization_tokens_used": modernization_result.get("tokens_used", 0),
                 "client_type": runtime_bundle["client_type"],
                 "client_context": runtime_bundle["client_context"],
+                "requested_runtime": runtime_bundle.get("requested_runtime", {}),
+                "runtime_requirements": runtime_bundle.get("effective_runtime_target", {}),
                 "runtime_recommendations": runtime_bundle["runtime_recommendations"],
                 "version_conflicts": runtime_bundle["version_conflicts"],
+                "runtime_validation": runtime_bundle["runtime_validation"],
             }
         }
 

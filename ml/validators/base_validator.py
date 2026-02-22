@@ -3,7 +3,6 @@ Base validator.
 """
 import ast
 from typing import Dict, List
-import re
 import logging
 
 logger = logging.getLogger(__name__)
@@ -76,28 +75,11 @@ class BaseValidator:
     
     def _validate_quantum_rules(self, code: str):
         """Validate general quantum computing rules"""
-        # Check for common quantum mistakes
-        
-        # 1. Qubit index consistency
-        qubit_pattern = r'[\(\[](\d+)[\)\]]'
-        qubit_indices = [int(m) for m in re.findall(qubit_pattern, code)]
-        
-        if qubit_indices:
-            max_index = max(qubit_indices)
-            # Check if circuit size is defined
-            circuit_size_pattern = r'(?:QuantumCircuit|device|wires)\s*[\(\[]\s*(\d+)'
-            size_match = re.search(circuit_size_pattern, code)
-            
-            if size_match:
-                declared_size = int(size_match.group(1))
-                if max_index >= declared_size:
-                    self.errors.append(
-                        f"Qubit index {max_index} out of range for circuit of size {declared_size}"
-                    )
-        
-        # 2. Measurement before using results
+        # Keep base checks conservative to avoid false positives.
+        # Framework-specific validators should implement deeper semantic checks.
+
+        # Measurement before reading results.
         if 'measure' in code and '.result()' in code:
-            # Basic check for measurement-result ordering
             measure_pos = code.find('measure')
             result_pos = code.find('.result()')
             if result_pos < measure_pos:

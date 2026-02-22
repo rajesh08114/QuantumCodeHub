@@ -14,8 +14,10 @@ from core.security import get_current_active_user
 from ml.prompts import CodeGenerationPrompts, ErrorFixingPrompts
 from services.llm_service import llm_service
 from services.rag_service import rag_service
-from services.runtime_compatibility import build_runtime_bundle
-from schemas.common import ClientContext
+from services.runtime_compatibility import build_runtime_bundle_with_rag
+from services.validator_service import validator_service
+from services.modernization_service import modernization_service
+from schemas.common import ClientContext, RuntimePreferences
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/fix", tags=["Error Fixing"])
@@ -37,6 +39,10 @@ class ErrorFixRequest(BaseModel):
     client_context: Optional[ClientContext] = Field(
         None,
         description="Client metadata for version-aware error fixing.",
+    )
+    runtime_preferences: Optional[RuntimePreferences] = Field(
+        None,
+        description="Optional explicit runtime target (legacy/modern/version-specific).",
     )
 
 
@@ -140,9 +146,11 @@ async def fix_code(
 
     try:
         framework = (request.framework or "").strip().lower()
-        runtime_bundle = build_runtime_bundle(
+        runtime_bundle = await build_runtime_bundle_with_rag(
             framework=framework,
             client_context=request.client_context,
+            runtime_preferences=request.runtime_preferences,
+            request_source="/api/fix/code",
         )
         source_code = (request.code or "").strip()
         error_message = (request.error_message or "").strip() or None
@@ -199,6 +207,38 @@ async def fix_code(
         if not fixed_code:
             fixed_code = source_code
 
+        validation_result = await validator_service.validate(
+            code=fixed_code,
+            framework=framework,
+            user_query=(error_message or f"Fix {framework} code errors and return runnable code."),
+            rag_context=rag_results.get("context", ""),
+            compatibility_context=runtime_bundle["compatibility_context"],
+        )
+
+        modernization_result = {
+            "attempted": False,
+            "applied": False,
+            "reason": "disabled",
+            "before_deprecation_count": 0,
+            "after_deprecation_count": 0,
+            "llm_provider": None,
+            "llm_model": None,
+            "tokens_used": 0,
+        }
+        if settings.MODERNIZATION_APPLY_ON_FIX:
+            modernization_result = await modernization_service.maybe_modernize(
+                framework=framework,
+                code=fixed_code,
+                validation_result=validation_result,
+                user_query=(error_message or "Modernize fixed code to stable APIs."),
+                rag_context=rag_results.get("context", ""),
+                compatibility_context=runtime_bundle["compatibility_context"],
+                runtime_preferences=runtime_bundle.get("requested_runtime"),
+            )
+            if modernization_result.get("applied"):
+                fixed_code = modernization_result["code"]
+                validation_result = modernization_result["validation_result"]
+
         issues_identified = _build_issue_summary(raw_text) if request.include_explanation else []
         explanation = _build_fix_explanation(raw_text) if request.include_explanation else None
 
@@ -215,11 +255,26 @@ async def fix_code(
                 "llm_model": llm_response.get("model"),
                 "llm_attempt": llm_response.get("attempt"),
                 "llm_fallback_used": llm_response.get("fallback_used", False),
+                "validation_passed": bool(validation_result.get("passed", False)),
+                "validation_errors": validation_result.get("errors", []),
+                "validation_warnings": validation_result.get("warnings", []),
+                "validation_evaluation": validation_result.get("evaluation", {}),
+                "modernization_attempted": modernization_result.get("attempted", False),
+                "modernization_applied": modernization_result.get("applied", False),
+                "modernization_reason": modernization_result.get("reason"),
+                "modernization_before_deprecations": modernization_result.get("before_deprecation_count", 0),
+                "modernization_after_deprecations": modernization_result.get("after_deprecation_count", 0),
+                "modernization_llm_provider": modernization_result.get("llm_provider"),
+                "modernization_llm_model": modernization_result.get("llm_model"),
+                "modernization_tokens_used": modernization_result.get("tokens_used", 0),
                 "latency_ms": int((time.time() - start) * 1000),
                 "client_type": runtime_bundle["client_type"],
                 "client_context": runtime_bundle["client_context"],
+                "requested_runtime": runtime_bundle.get("requested_runtime", {}),
+                "runtime_requirements": runtime_bundle.get("effective_runtime_target", {}),
                 "runtime_recommendations": runtime_bundle["runtime_recommendations"],
                 "version_conflicts": runtime_bundle["version_conflicts"],
+                "runtime_validation": runtime_bundle["runtime_validation"],
             },
         }
         return response
