@@ -9,6 +9,7 @@ import hashlib
 import logging
 import re
 import time
+from urllib.parse import urlparse
 
 import chromadb
 
@@ -51,6 +52,14 @@ class RAGService:
         "using",
         "with",
     }
+    _LATEST_VERSION_LABELS = {"latest", "stable", "current", "main", "master", "head"}
+    _FRAMEWORKS_WITH_VERSIONING = {
+        "qiskit",
+        "pennylane",
+        "cirq",
+        "torchquantum",
+        "tensorflow_quantum",
+    }
 
     def __init__(self):
         self.top_k = settings.RAG_TOP_K or 5
@@ -74,6 +83,19 @@ class RAGService:
         self.rrf_weight = max(0.0, float(settings.RAG_RRF_WEIGHT or 0.10))
         self.framework_boost = max(0.0, float(settings.RAG_FRAMEWORK_BOOST or 0.08))
         self.rrf_k = max(1, int(settings.RAG_RRF_K or 60))
+        self.default_to_latest_version = bool(
+            getattr(settings, "RAG_DEFAULT_TO_LATEST_VERSION", True)
+        )
+        self.latest_version_cache_ttl_seconds = max(
+            30, int(getattr(settings, "RAG_LATEST_VERSION_CACHE_TTL_SECONDS", 600) or 600)
+        )
+        self.legacy_mode_allow_all_versions = bool(
+            getattr(settings, "RAG_LEGACY_MODE_ALLOW_ALL_VERSIONS", True)
+        )
+        self.strict_version_selection = bool(
+            getattr(settings, "RAG_STRICT_VERSION_SELECTION", True)
+        )
+        self._framework_version_cache: Dict[str, Dict] = {}
 
     def _resolve_persist_dir(self, persist_dir: str) -> Path:
         base_dir = Path(__file__).resolve().parent.parent
@@ -103,10 +125,166 @@ class RAGService:
             "pennylane": ["pennylane", "xanadu"],
             "cirq": ["cirq", "quantumlib"],
             "torchquantum": ["torchquantum", "mit-han-lab"],
+            "tensorflow_quantum": ["tensorflow_quantum", "tfq", "tensorflow/quantum"],
         }
         return aliases.get(normalized, [normalized] if normalized else [])
 
+    def _looks_like_url(self, value: str) -> bool:
+        candidate = (value or "").strip().lower()
+        return candidate.startswith("http://") or candidate.startswith("https://")
+
+    def _canonical_source_type(self, value: str) -> str:
+        raw = str(value or "").strip().lower()
+        if not raw or raw in {"unknown", "<unknown>", "none", "null"}:
+            return ""
+        mapping = {
+            "github_doc": "github_docs",
+            "github_docs": "github_docs",
+            "official_doc": "official_docs",
+            "official_docs": "official_docs",
+            "html": "official_docs",
+            "markdown": "official_docs",
+            "text": "official_docs",
+            "pdf": "official_docs",
+            "jupyter_notebook": "official_docs",
+            "notebook": "official_docs",
+            "web": "official_docs",
+            "framework_doc": "official_docs",
+            "documentation": "official_docs",
+            "api": "api_reference",
+            "api_docs": "api_reference",
+            "api_reference": "api_reference",
+            "code": "api_reference",
+            "qasm": "api_reference",
+            "hardware": "hardware_docs",
+            "hardware_docs": "hardware_docs",
+        }
+        return mapping.get(raw, raw)
+
+    def _infer_source_type(self, metadata: Dict) -> str:
+        existing = self._canonical_source_type(metadata.get("source_type", ""))
+        if existing:
+            return existing
+
+        type_hint = str(metadata.get("type", "")).strip().lower()
+        section_hint = str(metadata.get("section", "")).strip().lower()
+        source = str(metadata.get("source", "")).strip().lower()
+        url = str(metadata.get("url", "")).strip().lower()
+        path = str(metadata.get("path", "")).strip().lower()
+        haystack = " ".join([type_hint, section_hint, source, url, path])
+
+        if any(token in haystack for token in ["hardware", "backend", "device", "sampler"]):
+            return "hardware_docs"
+        if any(token in haystack for token in ["/api/", "/stubs/", "api_reference", "reference"]):
+            return "api_reference"
+        if "github.com" in haystack:
+            return "github_docs"
+        if any(token in haystack for token in ["tutorial", "guide", "notebook", ".ipynb"]):
+            return "official_docs"
+        if any(token in haystack for token in ["/docs", "documentation", "readthedocs", "readme"]):
+            return "official_docs"
+        if type_hint in {"code", "qasm"}:
+            return "api_reference"
+        if type_hint in {"documentation", "readme", "framework_doc", "markdown", "text"}:
+            return "official_docs"
+        return "official_docs"
+
+    def _normalize_metadata(self, metadata: Optional[Dict], requested_framework: str = "") -> Dict:
+        normalized = dict(metadata or {})
+        requested = self._normalize_framework_name(requested_framework)
+
+        framework_value = self._normalize_framework_name(str(normalized.get("framework", "")))
+        if not framework_value:
+            infer_haystack = " ".join(
+                [
+                    str(normalized.get("source", "")),
+                    str(normalized.get("url", "")),
+                    str(normalized.get("path", "")),
+                    str(normalized.get("section", "")),
+                    str(normalized.get("type", "")),
+                ]
+            ).lower()
+            for candidate in self._FRAMEWORKS_WITH_VERSIONING:
+                aliases = self._framework_aliases(candidate)
+                if any(alias in infer_haystack for alias in aliases):
+                    framework_value = candidate
+                    break
+        if not framework_value and requested:
+            framework_value = requested
+        if framework_value:
+            normalized["framework"] = framework_value
+
+        version_value = str(normalized.get("version", "")).strip()
+        if version_value:
+            normalized["version"] = version_value
+
+        url_value = str(normalized.get("url", "")).strip()
+        source_value = str(normalized.get("source", "")).strip()
+        path_value = str(normalized.get("path", "")).strip()
+
+        if not url_value and self._looks_like_url(source_value):
+            url_value = source_value
+        if not source_value and url_value:
+            source_value = url_value
+        if not path_value:
+            parsed_path = ""
+            if url_value and self._looks_like_url(url_value):
+                parsed_path = str(urlparse(url_value).path or "")
+            elif source_value and self._looks_like_url(source_value):
+                parsed_path = str(urlparse(source_value).path or "")
+            if parsed_path:
+                path_value = parsed_path
+
+        if url_value:
+            normalized["url"] = url_value
+        if source_value:
+            normalized["source"] = source_value
+        if path_value:
+            normalized["path"] = path_value
+
+        source_type = self._infer_source_type(normalized)
+        normalized["source_type"] = source_type
+
+        section_value = str(normalized.get("section", "")).strip()
+        if not section_value:
+            section_value = source_type or str(normalized.get("type", "")).strip() or "general"
+        normalized["section"] = section_value
+
+        type_value = str(normalized.get("type", "")).strip()
+        if not type_value:
+            if source_type == "github_docs":
+                type_value = "github_doc"
+            elif source_type == "api_reference":
+                type_value = "api_docs"
+            elif source_type == "hardware_docs":
+                type_value = "hardware_docs"
+            else:
+                type_value = "framework_doc"
+        normalized["type"] = type_value
+
+        if "layer" not in normalized:
+            normalized["layer"] = 3 if source_type == "github_docs" else (2 if source_type == "api_reference" else 1)
+        if "priority" not in normalized:
+            normalized["priority"] = 3 if source_type in {"api_reference", "hardware_docs"} else 2
+
+        return normalized
+
+    def _metadata_quality_score(self, metadata: Dict) -> float:
+        score = 0.0
+        if str(metadata.get("source_type", "")).strip():
+            score += 0.35
+        if str(metadata.get("url", "")).strip() or str(metadata.get("source", "")).strip():
+            score += 0.30
+        if str(metadata.get("framework", "")).strip():
+            score += 0.20
+        if str(metadata.get("version", "")).strip():
+            score += 0.10
+        if str(metadata.get("path", "")).strip():
+            score += 0.05
+        return min(score, 1.0)
+
     def _matches_framework(self, metadata: Dict, aliases: List[str]) -> bool:
+        metadata = self._normalize_metadata(metadata)
         if not aliases:
             return True
 
@@ -243,6 +421,398 @@ class RAGService:
 
         return config
 
+    def _normalize_framework_name(self, framework: str) -> str:
+        return (framework or "").strip().lower()
+
+    def _normalize_runtime_mode(self, runtime_preferences: Optional[Dict]) -> str:
+        prefs = runtime_preferences or {}
+        mode = (prefs.get("mode") or "").strip().lower()
+        if mode in {"auto", "modern", "legacy"}:
+            return mode
+        return "auto"
+
+    def _extract_framework_version_spec(
+        self,
+        framework: str,
+        runtime_preferences: Optional[Dict],
+        version_constraint: Optional[str] = None,
+    ) -> str:
+        if version_constraint and str(version_constraint).strip():
+            return str(version_constraint).strip()
+
+        prefs = runtime_preferences or {}
+        requested = (
+            prefs.get("packages")
+            or prefs.get("package_versions")
+            or {}
+        )
+        safe_framework = self._normalize_framework_name(framework)
+        if isinstance(requested, dict):
+            for package_name, spec in requested.items():
+                package_key = (package_name or "").strip().lower()
+                if package_key == safe_framework and str(spec or "").strip():
+                    return str(spec).strip()
+
+        framework_spec = prefs.get("framework_version")
+        if isinstance(framework_spec, str) and framework_spec.strip():
+            return framework_spec.strip()
+
+        return ""
+
+    def _parse_version_tuple(self, value: str) -> Optional[tuple]:
+        numbers = re.findall(r"\d+", value or "")
+        if not numbers:
+            return None
+        return tuple(int(item) for item in numbers[:4])
+
+    def _compare_versions(self, left: tuple, right: tuple) -> int:
+        width = max(len(left), len(right))
+        lhs = left + (0,) * (width - len(left))
+        rhs = right + (0,) * (width - len(right))
+        if lhs < rhs:
+            return -1
+        if lhs > rhs:
+            return 1
+        return 0
+
+    def _is_version_in_spec(self, version_value: str, spec: str) -> Optional[bool]:
+        installed = self._parse_version_tuple(version_value)
+        if installed is None:
+            return None
+
+        clauses = [item.strip() for item in (spec or "").split(",") if item.strip()]
+        if not clauses:
+            return None
+
+        for clause in clauses:
+            range_match = re.match(
+                r"^([0-9][0-9A-Za-z.\-+]*)\s*-\s*([0-9][0-9A-Za-z.\-+]*)$",
+                clause,
+            )
+            if range_match:
+                lower = self._parse_version_tuple(range_match.group(1))
+                upper = self._parse_version_tuple(range_match.group(2))
+                if lower is None or upper is None:
+                    return None
+                if self._compare_versions(installed, lower) < 0 or self._compare_versions(installed, upper) > 0:
+                    return False
+                continue
+
+            match = re.match(r"^(>=|<=|==|!=|>|<)\s*([0-9][0-9A-Za-z.\-+]*)$", clause)
+            operator = "=="
+            target_text = clause
+            if match:
+                operator = match.group(1)
+                target_text = match.group(2)
+            target = self._parse_version_tuple(target_text)
+            if target is None:
+                return None
+
+            cmp_value = self._compare_versions(installed, target)
+            if operator == ">" and not (cmp_value > 0):
+                return False
+            if operator == ">=" and not (cmp_value >= 0):
+                return False
+            if operator == "<" and not (cmp_value < 0):
+                return False
+            if operator == "<=" and not (cmp_value <= 0):
+                return False
+            if operator == "==" and not (cmp_value == 0):
+                return False
+            if operator == "!=" and not (cmp_value != 0):
+                return False
+        return True
+
+    def _version_sort_key(self, version: str):
+        text = (version or "").strip()
+        lowered = text.lower()
+        prerelease = bool(re.search(r"(?:alpha|beta|rc|dev|preview|pre|a|b)\d*", lowered))
+        # Prefer stable release over prerelease for same base version.
+        core_text = re.split(r"(?:alpha|beta|rc|dev|preview|pre|a|b)", lowered, maxsplit=1)[0]
+        core_parsed = self._parse_version_tuple(core_text or "")
+        parsed = self._parse_version_tuple(text or "")
+
+        if core_parsed is not None:
+            return (
+                3,
+                core_parsed,
+                1 if not prerelease else 0,
+                parsed or tuple(),
+                lowered,
+            )
+        if lowered in self._LATEST_VERSION_LABELS:
+            return (2, tuple(), 0, lowered)
+        if lowered:
+            return (1, tuple(), 0, lowered)
+        return (0, tuple(), 0, lowered)
+
+    def _strip_prefix_operators(self, spec: str) -> str:
+        return re.sub(r"^[\s<>=!~^]+", "", spec or "").strip()
+
+    def _match_requested_version(self, versions: List[str], requested_spec: str) -> Optional[str]:
+        if not versions:
+            return None
+        spec = (requested_spec or "").strip()
+        if not spec:
+            return None
+
+        direct_lookup = {(item or "").strip().lower(): item for item in versions}
+        if spec.lower() in direct_lookup:
+            return direct_lookup[spec.lower()]
+
+        cleaned = self._strip_prefix_operators(spec)
+        if cleaned.lower() in direct_lookup:
+            return direct_lookup[cleaned.lower()]
+
+        normalized_versions = {self._strip_prefix_operators(item).lower(): item for item in versions}
+        if cleaned.lower() in normalized_versions:
+            return normalized_versions[cleaned.lower()]
+
+        wildcard_match = re.search(r"\*", cleaned)
+        if wildcard_match:
+            prefix = cleaned[: wildcard_match.start()].rstrip(".").lower()
+            matches = [
+                item
+                for item in versions
+                if self._strip_prefix_operators(item).lower().startswith(prefix)
+            ]
+            if matches:
+                return max(matches, key=self._version_sort_key)
+
+        if any(token in spec for token in [">", "<", "=", "!", ","]):
+            spec_matches = [
+                item for item in versions if self._is_version_in_spec(item, spec) is True
+            ]
+            if spec_matches:
+                return max(spec_matches, key=self._version_sort_key)
+
+        parsed_spec = self._parse_version_tuple(cleaned)
+        if parsed_spec is not None:
+            prefix_matches = []
+            for item in versions:
+                parsed_item = self._parse_version_tuple(item)
+                if parsed_item is None:
+                    continue
+                if parsed_item[: len(parsed_spec)] == parsed_spec:
+                    prefix_matches.append(item)
+            if prefix_matches:
+                return max(prefix_matches, key=self._version_sort_key)
+
+        return None
+
+    def _scan_framework_versions(self, collection, framework: str) -> List[str]:
+        safe_framework = self._normalize_framework_name(framework)
+        if not safe_framework:
+            return []
+
+        discovered = set()
+        batch = 4000
+        offset = 0
+        where_error = None
+        try:
+            while True:
+                response = collection.get(
+                    include=["metadatas"],
+                    where={"framework": safe_framework},
+                    limit=batch,
+                    offset=offset,
+                )
+                metadatas = response.get("metadatas", [])
+                if not metadatas:
+                    break
+                for metadata in metadatas:
+                    normalized = self._normalize_metadata(metadata, requested_framework=safe_framework)
+                    metadata_framework = self._normalize_framework_name(normalized.get("framework", ""))
+                    if metadata_framework != safe_framework:
+                        continue
+                    version_value = str(normalized.get("version", "")).strip()
+                    if version_value:
+                        discovered.add(version_value)
+                offset += batch
+                if len(metadatas) < batch:
+                    break
+        except Exception as filter_error:
+            where_error = filter_error
+
+        # Fallback scan all records if where-filter failed or yielded no matches.
+        if where_error or not discovered:
+            if where_error:
+                logger.warning(
+                    "RAG version scan fallback activated framework=%s reason=%s",
+                    safe_framework,
+                    where_error,
+                )
+            total = collection.count()
+            offset = 0
+            while offset < total:
+                response = collection.get(
+                    include=["metadatas"],
+                    limit=batch,
+                    offset=offset,
+                )
+                metadatas = response.get("metadatas", [])
+                for metadata in metadatas:
+                    normalized = self._normalize_metadata(metadata, requested_framework=safe_framework)
+                    metadata_framework = self._normalize_framework_name(normalized.get("framework", ""))
+                    if metadata_framework != safe_framework:
+                        continue
+                    version_value = str(normalized.get("version", "")).strip()
+                    if version_value:
+                        discovered.add(version_value)
+                offset += batch
+        return sorted(discovered, key=self._version_sort_key)
+
+    def _get_framework_versions(self, collection, framework: str) -> Dict:
+        safe_framework = self._normalize_framework_name(framework)
+        now = time.time()
+        cached = self._framework_version_cache.get(safe_framework)
+        if cached and float(cached.get("expires_at", 0)) > now:
+            snapshot = dict(cached)
+            snapshot["cache_hit"] = True
+            return snapshot
+
+        versions = self._scan_framework_versions(collection, safe_framework)
+        latest = max(versions, key=self._version_sort_key) if versions else ""
+        snapshot = {
+            "framework": safe_framework,
+            "versions": versions,
+            "latest_version": latest,
+            "version_count": len(versions),
+            "expires_at": now + self.latest_version_cache_ttl_seconds,
+            "cache_hit": False,
+        }
+        self._framework_version_cache[safe_framework] = snapshot
+        return dict(snapshot)
+
+    def get_framework_version_marker(self, framework: str) -> str:
+        """
+        Return a stable marker for cache keys that changes when framework docs version set changes.
+        """
+        safe_framework = self._normalize_framework_name(framework)
+        if not safe_framework or safe_framework not in self._FRAMEWORKS_WITH_VERSIONING:
+            return f"{safe_framework or 'unknown'}:unversioned"
+
+        collection = self.collection or self._safe_get_collection(self.collection_name)
+        if collection is None:
+            return f"{safe_framework}:collection-missing"
+
+        snapshot = self._get_framework_versions(collection, safe_framework)
+        latest = str(snapshot.get("latest_version", "") or "none")
+        count = int(snapshot.get("version_count", 0) or 0)
+        return f"{safe_framework}:{latest}:{count}"
+
+    def _resolve_version_filter(
+        self,
+        collection,
+        framework: str,
+        runtime_preferences: Optional[Dict],
+        version_constraint: Optional[str],
+        prefer_latest_version: Optional[bool],
+    ) -> Dict:
+        safe_framework = self._normalize_framework_name(framework)
+        mode = self._normalize_runtime_mode(runtime_preferences)
+        requested_spec = self._extract_framework_version_spec(
+            framework=safe_framework,
+            runtime_preferences=runtime_preferences,
+            version_constraint=version_constraint,
+        )
+        should_prefer_latest = (
+            self.default_to_latest_version
+            if prefer_latest_version is None
+            else bool(prefer_latest_version)
+        )
+
+        result = {
+            "active": False,
+            "framework": safe_framework,
+            "mode": mode,
+            "strict": self.strict_version_selection,
+            "strategy": "none",
+            "requested_spec": requested_spec,
+            "selected_version": "",
+            "latest_version": "",
+            "available_version_count": 0,
+            "available_versions": [],
+            "cache_hit": False,
+            "fallback_to_unfiltered": False,
+            "error": "",
+            "where": None,
+        }
+
+        if not safe_framework or safe_framework not in self._FRAMEWORKS_WITH_VERSIONING:
+            result["strategy"] = "framework_not_version_targeted"
+            return result
+
+        if (
+            mode == "legacy"
+            and self.legacy_mode_allow_all_versions
+            and not requested_spec
+            and not self.strict_version_selection
+        ):
+            result["strategy"] = "legacy_all_versions"
+            return result
+
+        if not requested_spec and not should_prefer_latest:
+            result["strategy"] = "latest_preference_disabled"
+            return result
+
+        version_snapshot = self._get_framework_versions(collection, safe_framework)
+        result["available_version_count"] = int(version_snapshot.get("version_count", 0) or 0)
+        result["available_versions"] = list(version_snapshot.get("versions", []))
+        result["latest_version"] = str(version_snapshot.get("latest_version", "") or "")
+        result["cache_hit"] = bool(version_snapshot.get("cache_hit", False))
+
+        available_versions = result["available_versions"]
+        if not available_versions:
+            result["strategy"] = "no_versions_available"
+            result["error"] = (
+                f"No versioned documents found for framework '{safe_framework}' in collection "
+                f"'{self.collection_name}'."
+            )
+            return result
+
+        selected_version = ""
+
+        if requested_spec:
+            selected_version = self._match_requested_version(available_versions, requested_spec) or ""
+            if selected_version:
+                result["strategy"] = "requested_version_spec"
+            else:
+                result["strategy"] = "requested_spec_unmatched"
+                result["error"] = (
+                    f"Requested runtime version '{requested_spec}' for framework '{safe_framework}' "
+                    f"was not found in ChromaDB."
+                )
+                if not self.strict_version_selection:
+                    if mode == "legacy" and self.legacy_mode_allow_all_versions:
+                        result["strategy"] = "requested_spec_unmatched_legacy_fallback"
+                        return result
+                    if should_prefer_latest and result["latest_version"]:
+                        selected_version = result["latest_version"]
+                        result["strategy"] = "requested_spec_unmatched_latest_fallback"
+                        result["error"] = ""
+                    else:
+                        return result
+                else:
+                    return result
+        elif should_prefer_latest and result["latest_version"]:
+            selected_version = result["latest_version"]
+            result["strategy"] = "latest_default"
+        else:
+            result["strategy"] = "no_version_selected"
+            return result
+
+        result["selected_version"] = selected_version
+        result["active"] = bool(selected_version)
+        if result["active"]:
+            result["where"] = {
+                "$and": [
+                    {"framework": safe_framework},
+                    {"version": selected_version},
+                ]
+            }
+        return result
+
     def _tokenize(self, text: str) -> List[str]:
         tokens = re.findall(r"[a-zA-Z_][a-zA-Z0-9_\-\.]{1,}", (text or "").lower())
         return [t for t in tokens if t not in self._STOPWORDS]
@@ -280,21 +850,31 @@ class RAGService:
         return variants[: max_query_variants]
 
     def _doc_id(self, content: str, metadata: Dict) -> str:
-        explicit = metadata.get("id") or metadata.get("doc_id") or metadata.get("chunk_id")
-        if explicit:
-            return str(explicit)
-        source = metadata.get("source", "")
-        path = metadata.get("path", "")
-        section = metadata.get("section", "") or metadata.get("type", "")
-        signature = f"{source}|{path}|{section}|{self._query_preview(content, 180)}"
+        normalized = self._normalize_metadata(metadata)
+        explicit = normalized.get("id") or normalized.get("doc_id")
+        if explicit and str(explicit).strip():
+            return str(explicit).strip()
+
+        source = normalized.get("source") or normalized.get("url") or ""
+        path = normalized.get("path", "")
+        section = normalized.get("section", "") or normalized.get("type", "")
+        framework = normalized.get("framework", "")
+        version = normalized.get("version", "")
+        chunk_token = normalized.get("chunk_hash") or normalized.get("chunk_id") or ""
+        signature = (
+            f"{framework}|{version}|{source}|{path}|{section}|{chunk_token}|"
+            f"{self._query_preview(content, 180)}"
+        )
         return hashlib.sha1(signature.encode("utf-8", errors="ignore")).hexdigest()
 
     def _source_key(self, doc: Dict) -> str:
-        metadata = doc.get("metadata") or {}
+        metadata = self._normalize_metadata(doc.get("metadata") or {})
         return str(
             doc.get("source")
             or metadata.get("source")
+            or metadata.get("url")
             or metadata.get("path")
+            or metadata.get("source_type")
             or doc.get("section")
             or "unknown"
         ).lower()
@@ -303,13 +883,16 @@ class RAGService:
         if not query_terms:
             return 0.0
         query_set = set(query_terms)
-        metadata = doc.get("metadata") or {}
+        metadata = self._normalize_metadata(doc.get("metadata") or {})
         text = " ".join(
             [
                 doc.get("content", ""),
+                str(metadata.get("title", "")),
                 doc.get("section", ""),
                 doc.get("source", ""),
+                str(metadata.get("url", "")),
                 str(metadata.get("path", "")),
+                str(metadata.get("source_type", "")),
                 str(metadata.get("type", "")),
             ]
         )
@@ -403,6 +986,9 @@ class RAGService:
         top_k: int = None,
         score_threshold: Optional[float] = None,
         request_source: str = "unknown",
+        runtime_preferences: Optional[Dict] = None,
+        version_constraint: Optional[str] = None,
+        prefer_latest_version: Optional[bool] = None,
     ) -> Dict:
         """
         Retrieve relevant documentation for a query.
@@ -417,11 +1003,12 @@ class RAGService:
         normalized_query = (query or "").strip()
         limit = max(1, top_k or self.top_k)
         logger.info(
-            "RAG request started source=%s framework=%s top_k=%s threshold=%s query_preview=%s",
+            "RAG request started source=%s framework=%s top_k=%s threshold=%s mode=%s query_preview=%s",
             request_source,
             framework,
             limit,
             score_threshold,
+            self._normalize_runtime_mode(runtime_preferences),
             self._query_preview(normalized_query),
         )
 
@@ -463,6 +1050,55 @@ class RAGService:
                 query=normalized_query,
             )
             profile = self._profile_config(active_profile)
+            version_filter = self._resolve_version_filter(
+                collection=collection,
+                framework=framework,
+                runtime_preferences=runtime_preferences,
+                version_constraint=version_constraint,
+                prefer_latest_version=prefer_latest_version,
+            )
+            if self.strict_version_selection and version_filter.get("error"):
+                logger.error(
+                    "RAG strict version selection blocked request source=%s framework=%s strategy=%s error=%s",
+                    request_source,
+                    framework,
+                    version_filter.get("strategy"),
+                    version_filter.get("error"),
+                )
+                return {
+                    "documents": [],
+                    "context": "",
+                    "count": 0,
+                    "average_score": 0,
+                    "framework": framework,
+                    "error": str(version_filter.get("error")),
+                    "retrieval_metadata": {
+                        "profile": active_profile,
+                        "query_variants": [],
+                        "candidate_count": 0,
+                        "framework_candidate_count": 0,
+                        "selected_count": 0,
+                        "fetch_limit": 0,
+                        "weights": {
+                            "semantic": profile["semantic_weight"],
+                            "lexical": profile["lexical_weight"],
+                            "rrf": profile["rrf_weight"],
+                            "framework_boost": profile["framework_boost"],
+                        },
+                        "version_filter": {
+                            "active": version_filter.get("active", False),
+                            "strict": version_filter.get("strict", self.strict_version_selection),
+                            "strategy": version_filter.get("strategy"),
+                            "mode": version_filter.get("mode"),
+                            "requested_spec": version_filter.get("requested_spec"),
+                            "selected_version": version_filter.get("selected_version"),
+                            "latest_version": version_filter.get("latest_version"),
+                            "available_version_count": version_filter.get("available_version_count", 0),
+                            "fallback_to_unfiltered": version_filter.get("fallback_to_unfiltered", False),
+                            "error": version_filter.get("error", ""),
+                        },
+                    },
+                }
 
             query_variants = self._build_query_variants(
                 normalized_query,
@@ -485,11 +1121,78 @@ class RAGService:
             )
 
             query_vectors = embedding_service.encode(query_variants).tolist()
-            result = collection.query(
-                query_embeddings=query_vectors,
-                n_results=fetch_limit,
-                include=["documents", "metadatas", "distances"],
-            )
+            query_kwargs = {
+                "query_embeddings": query_vectors,
+                "n_results": fetch_limit,
+                "include": ["documents", "metadatas", "distances"],
+            }
+            if version_filter.get("where"):
+                query_kwargs["where"] = version_filter["where"]
+
+            result = collection.query(**query_kwargs)
+
+            raw_docs_by_query = result.get("documents") or []
+            if version_filter.get("where") and not any(raw_docs_by_query):
+                if self.strict_version_selection:
+                    version_filter["error"] = (
+                        f"No documents found for strict version filter framework='{framework}' "
+                        f"version='{version_filter.get('selected_version')}'."
+                    )
+                    logger.error(
+                        "RAG strict version selection yielded zero documents source=%s framework=%s selected_version=%s",
+                        request_source,
+                        framework,
+                        version_filter.get("selected_version"),
+                    )
+                    return {
+                        "documents": [],
+                        "context": "",
+                        "count": 0,
+                        "average_score": 0,
+                        "framework": framework,
+                        "error": str(version_filter["error"]),
+                        "retrieval_metadata": {
+                            "profile": active_profile,
+                            "query_variants": query_variants,
+                            "candidate_count": 0,
+                            "framework_candidate_count": 0,
+                            "selected_count": 0,
+                            "fetch_limit": fetch_limit,
+                            "weights": {
+                                "semantic": profile["semantic_weight"],
+                                "lexical": profile["lexical_weight"],
+                                "rrf": profile["rrf_weight"],
+                                "framework_boost": profile["framework_boost"],
+                            },
+                            "version_filter": {
+                                "active": version_filter.get("active", False),
+                                "strict": version_filter.get("strict", self.strict_version_selection),
+                                "strategy": version_filter.get("strategy"),
+                                "mode": version_filter.get("mode"),
+                                "requested_spec": version_filter.get("requested_spec"),
+                                "selected_version": version_filter.get("selected_version"),
+                                "latest_version": version_filter.get("latest_version"),
+                                "available_version_count": version_filter.get("available_version_count", 0),
+                                "fallback_to_unfiltered": False,
+                                "error": version_filter.get("error", ""),
+                            },
+                        },
+                    }
+
+                version_filter["fallback_to_unfiltered"] = True
+                logger.warning(
+                    "RAG version-filter query returned no results source=%s framework=%s selected_version=%s strategy=%s; retrying unfiltered",
+                    request_source,
+                    framework,
+                    version_filter.get("selected_version"),
+                    version_filter.get("strategy"),
+                )
+                fallback_kwargs = {
+                    "query_embeddings": query_vectors,
+                    "n_results": fetch_limit,
+                    "include": ["documents", "metadatas", "distances"],
+                }
+                result = collection.query(**fallback_kwargs)
 
             raw_docs_by_query = result.get("documents") or []
             raw_meta_by_query = result.get("metadatas") or []
@@ -503,12 +1206,17 @@ class RAGService:
                 raw_dists = raw_dist_by_query[q_idx] if q_idx < len(raw_dist_by_query) else []
 
                 for rank, (content, metadata, distance) in enumerate(zip(raw_docs, raw_metas, raw_dists), start=1):
-                    metadata = metadata or {}
+                    metadata = self._normalize_metadata(metadata, requested_framework=framework)
                     safe_content = content or ""
                     doc_id = self._doc_id(safe_content, metadata)
                     semantic_score = self._distance_to_similarity(distance)
-                    source = metadata.get("source", "")
-                    section = metadata.get("section") or metadata.get("type") or metadata.get("path", "general")
+                    source = metadata.get("source") or metadata.get("url") or ""
+                    section = (
+                        metadata.get("section")
+                        or metadata.get("source_type")
+                        or metadata.get("type")
+                        or metadata.get("path", "general")
+                    )
                     framework_match = self._matches_framework(metadata, aliases)
 
                     existing = candidates_map.get(doc_id)
@@ -518,10 +1226,13 @@ class RAGService:
                             "content": safe_content,
                             "source": source,
                             "section": section,
+                            "source_type": metadata.get("source_type", ""),
+                            "version": metadata.get("version", ""),
                             "score": 0.0,
                             "semantic_score": semantic_score,
                             "lexical_score": 0.0,
                             "rrf_score": 0.0,
+                            "metadata_quality": self._metadata_quality_score(metadata),
                             "framework_match": framework_match,
                             "metadata": metadata,
                             "rank_positions": [rank],
@@ -532,6 +1243,10 @@ class RAGService:
                             existing["semantic_score"] = semantic_score
                         if framework_match:
                             existing["framework_match"] = True
+                        existing["metadata_quality"] = max(
+                            float(existing.get("metadata_quality", 0.0)),
+                            self._metadata_quality_score(metadata),
+                        )
 
             all_candidates = list(candidates_map.values())
             for doc in all_candidates:
@@ -557,6 +1272,8 @@ class RAGService:
             all_candidates.sort(
                 key=lambda item: (
                     item.get("score", 0.0),
+                    item.get("framework_match", False),
+                    item.get("metadata_quality", 0.0),
                     item.get("semantic_score", 0.0),
                     item.get("lexical_score", 0.0),
                 ),
@@ -623,6 +1340,18 @@ class RAGService:
                         "rrf": profile["rrf_weight"],
                         "framework_boost": profile["framework_boost"],
                     },
+                    "version_filter": {
+                        "active": version_filter.get("active", False),
+                        "strict": version_filter.get("strict", self.strict_version_selection),
+                        "strategy": version_filter.get("strategy"),
+                        "mode": version_filter.get("mode"),
+                        "requested_spec": version_filter.get("requested_spec"),
+                        "selected_version": version_filter.get("selected_version"),
+                        "latest_version": version_filter.get("latest_version"),
+                        "available_version_count": version_filter.get("available_version_count", 0),
+                        "fallback_to_unfiltered": version_filter.get("fallback_to_unfiltered", False),
+                        "error": version_filter.get("error", ""),
+                    },
                 },
             }
             latency_ms = int((time.perf_counter() - start) * 1000)
@@ -666,14 +1395,18 @@ class RAGService:
         """Add a new document to the vector database."""
         try:
             collection = self._get_or_create_collection(collection_name or self.collection_name)
+            normalized_metadata = self._normalize_metadata(metadata)
 
             embedding = embedding_service.encode_single(content)
             collection.upsert(
                 ids=[doc_id],
                 embeddings=[embedding],
                 documents=[content],
-                metadatas=[metadata or {}],
+                metadatas=[normalized_metadata],
             )
+            framework = str(normalized_metadata.get("framework", "")).strip().lower()
+            if framework:
+                self._framework_version_cache.pop(framework, None)
             logger.info("Added document %s to %s", doc_id, collection_name)
         except Exception as e:
             logger.error("Error adding document: %s", e)
@@ -708,10 +1441,11 @@ class RAGService:
 
             hits = []
             for content, metadata, distance in zip(raw_documents, raw_metadatas, raw_distances):
+                normalized_metadata = self._normalize_metadata(metadata)
                 hits.append(
                     {
                         "content": content,
-                        "metadata": metadata or {},
+                        "metadata": normalized_metadata,
                         "score": round(self._distance_to_similarity(distance), 6),
                     }
                 )
@@ -740,6 +1474,8 @@ class RAGService:
                     "fetch_multiplier": self.fetch_multiplier,
                     "max_fetch_results": self.max_fetch_results,
                     "max_query_variants": self.max_query_variants,
+                    "default_to_latest_version": self.default_to_latest_version,
+                    "strict_version_selection": self.strict_version_selection,
                 },
             }
         except Exception as e:

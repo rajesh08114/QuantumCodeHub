@@ -1,55 +1,39 @@
+#!/usr/bin/env python3
 """
-Comprehensive endpoint test matrix for QuantumCodeHub backend.
+Qiskit-only endpoint retrieval diagnostic.
 
-Features:
-- Fixes validation metadata extraction to:
-  metadata.validation_evaluation.llm.passed
-- Logs full metadata blob when the expected path is missing.
-- Exercises multiple scenarios across:
-  /api/code/generate, /api/transpile/convert, /api/complete/suggest,
-  /api/explain/code, /api/fix/code, /api/chat/message
-- Aggregates grounding metrics and hallucination suppression rate.
+What it does:
+- tests Qiskit-related endpoints
+- stores request + response for each endpoint
+- extracts retrieval-related metadata (rag/runtime fields) from responses
+- writes one JSON report
 """
+
 from __future__ import annotations
 
 import argparse
 import json
 import statistics
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
 
-FRAMEWORKS = ["qiskit", "pennylane", "cirq", "torchquantum"]
+FRAMEWORK = "qiskit"
 
-RUNTIME_SCENARIOS = [
-    {
-        "name": "legacy",
-        "runtime_preferences": {
-            "mode": "legacy",
-            "python_version": "3.9",
-            "package_versions": {},
-            "allow_deprecated_apis": True,
-        },
-    },
-    {
-        "name": "modern",
-        "runtime_preferences": {
-            "mode": "modern",
-            "python_version": "3.11",
-            "package_versions": {},
-            "allow_deprecated_apis": False,
-        },
-    },
-]
 
-GENERATION_PROMPTS = [
-    "Create a 2-qubit Bell state and measure both qubits.",
-    "Create a 3-qubit GHZ state with execution and histogram output.",
-    "Generate a parameterized variational ansatz circuit with measurement.",
-]
+@dataclass
+class EndpointCase:
+    name: str
+    method: str
+    path: str
+    json_body: Optional[Dict[str, Any]] = None
+    requires_auth: bool = True
+    expected_statuses: Optional[List[int]] = None
+    profile: str = "default"
 
 
 def now_iso() -> str:
@@ -64,582 +48,585 @@ def percentile(values: List[float], p: float) -> float:
     return float(ordered[idx])
 
 
+def detect_auth_disabled(base_url: str, timeout_seconds: float) -> bool:
+    try:
+        resp = requests.get(f"{base_url.rstrip('/')}/api/auth/me", timeout=timeout_seconds)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def login_for_token(base_url: str, email: str, password: str, timeout_seconds: float) -> Optional[str]:
+    url = f"{base_url.rstrip('/')}/api/auth/login"
+    data = {
+        "username": email,
+        "password": password,
+        "grant_type": "password",
+    }
+    try:
+        resp = requests.post(url, data=data, timeout=timeout_seconds)
+        if resp.status_code != 200:
+            return None
+        payload = resp.json()
+        token = payload.get("access_token")
+        return token if isinstance(token, str) and token.strip() else None
+    except Exception:
+        return None
+
+
 def timed_request(
     session: requests.Session,
     method: str,
     url: str,
     timeout_seconds: float,
-    **kwargs,
+    **kwargs: Any,
 ) -> Tuple[Optional[requests.Response], float, Optional[str]]:
     start = time.perf_counter()
     try:
-        response = session.request(method, url, timeout=timeout_seconds, **kwargs)
-        latency_ms = (time.perf_counter() - start) * 1000
-        return response, latency_ms, None
+        resp = session.request(method=method, url=url, timeout=timeout_seconds, **kwargs)
+        return resp, (time.perf_counter() - start) * 1000.0, None
     except Exception as exc:
-        latency_ms = (time.perf_counter() - start) * 1000
-        return None, latency_ms, str(exc)
+        return None, (time.perf_counter() - start) * 1000.0, str(exc)
 
 
-def parse_json(response: Optional[requests.Response]) -> Dict[str, Any]:
+def parse_response_body(response: Optional[requests.Response], max_chars: int) -> Any:
     if response is None:
-        return {}
-    try:
-        payload = response.json()
-        return payload if isinstance(payload, dict) else {}
-    except Exception:
-        return {}
+        return None
+    content_type = str(response.headers.get("content-type", "")).lower()
+    if "application/json" in content_type:
+        try:
+            return response.json()
+        except Exception:
+            pass
+    text = response.text if hasattr(response, "text") else ""
+    if len(text) > max_chars:
+        text = text[:max_chars] + "...<truncated>"
+    return {"raw_text": text}
 
 
-def extract_llm_eval_metadata(payload: Dict[str, Any]) -> Dict[str, Any]:
-    metadata = payload.get("metadata", {}) if isinstance(payload.get("metadata"), dict) else {}
-    llm_eval: Dict[str, Any] = {}
-    validation_passed = None
-    try:
-        validation_passed = payload["metadata"]["validation_evaluation"]["llm"]["passed"]
-        raw_llm_eval = payload["metadata"]["validation_evaluation"]["llm"]
-        if isinstance(raw_llm_eval, dict):
-            llm_eval = raw_llm_eval
-    except Exception:
-        validation_eval = (
-            metadata.get("validation_evaluation", {})
-            if isinstance(metadata.get("validation_evaluation"), dict)
-            else {}
-        )
-        llm_eval = validation_eval.get("llm", {}) if isinstance(validation_eval.get("llm"), dict) else {}
-
-    grounding_metrics = (
-        llm_eval.get("grounding_metrics")
-        if isinstance(llm_eval.get("grounding_metrics"), dict)
-        else {}
-    )
-    metadata_blob = None
-    if validation_passed is None:
-        metadata_blob = json.dumps(metadata, ensure_ascii=True)[:2000]
-
+def runtime_preferences(profile: str) -> Dict[str, Any]:
+    # Keep target explicit and modern; backend RAG now defaults to latest when not explicitly constrained.
+    mode = "modern"
+    if profile == "hardware":
+        mode = "modern"
     return {
-        "validation_passed": validation_passed,
-        "grounding_metrics": grounding_metrics,
-        "metadata_blob_if_missing": metadata_blob,
+        "mode": mode,
+        "python_version": "3.11",
+        "package_versions": {
+            "qiskit": "2.3.0",
+        },
+        "allow_deprecated_apis": False,
     }
 
 
-def detect_auth_disabled(base_url: str, timeout_seconds: float) -> bool:
-    try:
-        response = requests.get(f"{base_url.rstrip('/')}/api/auth/me", timeout=timeout_seconds)
-        return response.status_code == 200
-    except Exception:
-        return False
+def prompt_for(profile: str, variation: str) -> str:
+    mode_text = "hardware-compatible" if profile == "hardware" else "simulator-compatible"
+    if variation == "ghz":
+        return f"Generate runnable qiskit GHZ-state code with measurement ({mode_text})."
+    if variation == "qft2":
+        return f"Generate runnable qiskit 2-qubit QFT code with measurement ({mode_text})."
+    return f"Generate runnable qiskit Bell-state code with measurement ({mode_text})."
 
 
-def run_tests(base_url: str, token: Optional[str], timeout_seconds: float, auth_disabled: bool) -> Dict[str, Any]:
+def qiskit_code(variation: str) -> str:
+    if variation == "ghz":
+        return (
+            "from qiskit import QuantumCircuit\n"
+            "qc = QuantumCircuit(3)\n"
+            "qc.h(0)\n"
+            "qc.cx(0,1)\n"
+            "qc.cx(1,2)\n"
+            "qc.measure_all()"
+        )
+    if variation == "qft2":
+        return (
+            "from qiskit import QuantumCircuit\n"
+            "qc = QuantumCircuit(2)\n"
+            "qc.h(1)\n"
+            "qc.cp(1.5708, 0, 1)\n"
+            "qc.h(0)\n"
+            "qc.measure_all()"
+        )
+    return (
+        "from qiskit import QuantumCircuit\n"
+        "qc = QuantumCircuit(2)\n"
+        "qc.h(0)\n"
+        "qc.cx(0,1)\n"
+        "qc.measure_all()"
+    )
+
+
+def broken_qiskit_code() -> Tuple[str, str]:
+    return (
+        "from qiskit import QuantumCircuit\nqc=QuantumCircuit(2)\nqc.h(0)\nqc.cx(0)",
+        "TypeError: cx() missing 1 required positional argument",
+    )
+
+
+def completion_prefix() -> str:
+    return "from qiskit import QuantumCircuit\nqc = QuantumCircuit(2)\nqc.h(0)\nqc."
+
+
+def transpile_source_qiskit() -> str:
+    return (
+        "from qiskit import QuantumCircuit\n"
+        "qc = QuantumCircuit(2)\n"
+        "qc.h(0)\n"
+        "qc.cx(0, 1)\n"
+        "qc.measure_all()"
+    )
+
+
+def _truncate_text(value: Any, max_chars: int) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    if len(text) > max_chars:
+        return text[:max_chars] + "...<truncated>"
+    return text
+
+
+def _get_nested(data: Any, path: List[str]) -> Any:
+    cur = data
+    for key in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+    return cur
+
+
+def _normalize_doc_item(item: Any, max_chars: int) -> Optional[Dict[str, Any]]:
+    if isinstance(item, str):
+        text = item.strip()
+        if not text:
+            return None
+        return {"text": _truncate_text(text, max_chars)}
+
+    if not isinstance(item, dict):
+        return None
+
+    text_value = (
+        item.get("content")
+        or item.get("text")
+        or item.get("document")
+        or item.get("chunk")
+        or item.get("page_content")
+        or ""
+    )
+    if isinstance(text_value, (list, dict)):
+        text_value = json.dumps(text_value, ensure_ascii=False, default=str)
+    text_value = str(text_value).strip()
+    if not text_value:
+        return None
+
+    metadata = item.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    return {
+        "text": _truncate_text(text_value, max_chars),
+        "score": item.get("score"),
+        "distance": item.get("distance"),
+        "source": item.get("source") or metadata.get("source"),
+        "url": item.get("url") or metadata.get("url"),
+        "file_path": item.get("file_path") or metadata.get("file_path"),
+        "framework": item.get("framework") or metadata.get("framework"),
+        "version": item.get("version") or metadata.get("version"),
+        "metadata": metadata,
+    }
+
+
+def _collect_retrieved_docs(body: Dict[str, Any], max_items: int, max_chars: int) -> List[Dict[str, Any]]:
+    doc_paths = [
+        ["documents"],
+        ["retrieved_documents"],
+        ["retrieval_documents"],
+        ["retrieval", "documents"],
+        ["retrieval", "chunks"],
+        ["retrieval_metadata", "documents"],
+        ["retrieval_metadata", "matched_documents"],
+        ["retrieval_metadata", "chunks"],
+        ["metadata", "retrieved_documents"],
+        ["metadata", "retrieval_documents"],
+        ["metadata", "rag_documents"],
+    ]
+
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+
+    for path in doc_paths:
+        value = _get_nested(body, path)
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            normalized = _normalize_doc_item(item, max_chars=max_chars)
+            if not normalized:
+                continue
+            dedup_key = (
+                normalized.get("text", ""),
+                normalized.get("url", ""),
+                normalized.get("file_path", ""),
+            )
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+            out.append(normalized)
+            if len(out) >= max_items:
+                return out
+    return out
+
+
+def _collect_retrieval_contexts(body: Dict[str, Any], max_items: int, max_chars: int) -> List[str]:
+    context_paths = [
+        ["context"],
+        ["rag_context"],
+        ["retrieved_context"],
+        ["retrieval_context"],
+        ["retrieval", "context"],
+        ["retrieval_metadata", "context"],
+        ["metadata", "context"],
+        ["metadata", "rag_context"],
+        ["metadata", "retrieved_context"],
+        ["metadata", "retrieval_context"],
+    ]
+
+    out: List[str] = []
+    seen: set = set()
+    for path in context_paths:
+        value = _get_nested(body, path)
+        if isinstance(value, str) and value.strip():
+            text = _truncate_text(value.strip(), max_chars=max_chars)
+            if text in seen:
+                continue
+            seen.add(text)
+            out.append(text)
+            if len(out) >= max_items:
+                return out
+    return out
+
+
+def _collect_runtime_evidence(runtime_validation: Dict[str, Any], max_chars: int) -> List[Dict[str, str]]:
+    evidence: List[Dict[str, str]] = []
+    python_item = runtime_validation.get("python", {}) if isinstance(runtime_validation.get("python"), dict) else {}
+    excerpt = python_item.get("evidence_excerpt")
+    if isinstance(excerpt, str) and excerpt.strip():
+        evidence.append({"target": "python", "excerpt": _truncate_text(excerpt.strip(), max_chars=max_chars)})
+
+    packages = runtime_validation.get("packages", {}) if isinstance(runtime_validation.get("packages"), dict) else {}
+    for pkg, item in packages.items():
+        if not isinstance(item, dict):
+            continue
+        snippet = item.get("evidence_excerpt")
+        if isinstance(snippet, str) and snippet.strip():
+            evidence.append({"target": str(pkg), "excerpt": _truncate_text(snippet.strip(), max_chars=max_chars)})
+    return evidence
+
+
+def extract_retrieval_info(
+    body: Any,
+    max_items: int = 12,
+    max_doc_chars: int = 1800,
+    max_context_chars: int = 5000,
+) -> Dict[str, Any]:
+    if not isinstance(body, dict):
+        return {}
+    metadata = body.get("metadata", {}) if isinstance(body.get("metadata"), dict) else {}
+    runtime_validation = metadata.get("runtime_validation", {}) if isinstance(metadata.get("runtime_validation"), dict) else {}
+    rag_version = metadata.get("rag_version", {}) if isinstance(metadata.get("rag_version"), dict) else {}
+    retrieval_metadata = body.get("retrieval_metadata", {}) if isinstance(body.get("retrieval_metadata"), dict) else {}
+    version_filter = retrieval_metadata.get("version_filter", {}) if isinstance(retrieval_metadata.get("version_filter"), dict) else {}
+    retrieved_docs = _collect_retrieved_docs(body, max_items=max_items, max_chars=max_doc_chars)
+    retrieved_contexts = _collect_retrieval_contexts(body, max_items=max_items, max_chars=max_context_chars)
+    runtime_evidence = _collect_runtime_evidence(runtime_validation, max_chars=max_doc_chars)
+    return {
+        "rag_documents": metadata.get("rag_documents"),
+        "rag_average_score": metadata.get("rag_average_score"),
+        "rag_version": rag_version,
+        "retrieval_version_filter": {
+            "selected_version": version_filter.get("selected_version"),
+            "latest_version": version_filter.get("latest_version"),
+            "strategy": version_filter.get("strategy"),
+            "fallback_to_unfiltered": version_filter.get("fallback_to_unfiltered"),
+            "active": version_filter.get("active"),
+        },
+        "runtime_validation": {
+            "status": runtime_validation.get("status"),
+            "documents_used": runtime_validation.get("documents_used"),
+            "rag_average_score": runtime_validation.get("rag_average_score"),
+            "error": runtime_validation.get("error"),
+        },
+        "runtime_requirements": metadata.get("runtime_requirements"),
+        "runtime_recommendations": metadata.get("runtime_recommendations"),
+        "version_conflicts": metadata.get("version_conflicts"),
+        "retrieved_content": {
+            "documents": retrieved_docs,
+            "contexts": retrieved_contexts,
+            "runtime_evidence_excerpts": runtime_evidence,
+            "documents_captured": len(retrieved_docs),
+            "contexts_captured": len(retrieved_contexts),
+        },
+    }
+
+
+def build_cases(auth_disabled: bool) -> List[EndpointCase]:
+    cases: List[EndpointCase] = [
+        EndpointCase(name="root", method="GET", path="/", requires_auth=False, expected_statuses=[200]),
+        EndpointCase(name="health", method="GET", path="/health", requires_auth=False, expected_statuses=[200]),
+        EndpointCase(
+            name="supported-conversions",
+            method="GET",
+            path="/api/transpile/supported-conversions",
+            requires_auth=False,
+            expected_statuses=[200],
+        ),
+        EndpointCase(name="me", method="GET", path="/api/auth/me", requires_auth=(not auth_disabled), expected_statuses=[200]),
+    ]
+
+    for profile in ("simulator", "hardware"):
+        prefs = runtime_preferences(profile)
+        for variation in ("bell", "ghz", "qft2"):
+            broken_code, broken_err = broken_qiskit_code()
+            cases.extend(
+                [
+                    EndpointCase(
+                        name=f"code-generate-{variation}-{profile}",
+                        method="POST",
+                        path="/api/code/generate",
+                        expected_statuses=[200],
+                        profile=profile,
+                        json_body={
+                            "prompt": prompt_for(profile, variation),
+                            "framework": FRAMEWORK,
+                            "include_explanation": True,
+                            "runtime_preferences": prefs,
+                            "client_context": {"client_type": "api"},
+                        },
+                    ),
+                    EndpointCase(
+                        name=f"completion-{variation}-{profile}",
+                        method="POST",
+                        path="/api/complete/suggest",
+                        expected_statuses=[200],
+                        profile=profile,
+                        json_body={
+                            "code_prefix": completion_prefix(),
+                            "framework": FRAMEWORK,
+                            "cursor_line": 3,
+                            "cursor_column": 3,
+                            "max_suggestions": 5,
+                            "runtime_preferences": prefs,
+                            "client_context": {"client_type": "api"},
+                        },
+                    ),
+                    EndpointCase(
+                        name=f"explain-{variation}-{profile}",
+                        method="POST",
+                        path="/api/explain/code",
+                        expected_statuses=[200],
+                        profile=profile,
+                        json_body={
+                            "code": qiskit_code(variation),
+                            "framework": FRAMEWORK,
+                            "detail_level": "intermediate",
+                            "include_math": False,
+                            "include_visualization": False,
+                            "runtime_preferences": prefs,
+                            "client_context": {"client_type": "api"},
+                        },
+                    ),
+                    EndpointCase(
+                        name=f"fix-{variation}-{profile}",
+                        method="POST",
+                        path="/api/fix/code",
+                        expected_statuses=[200],
+                        profile=profile,
+                        json_body={
+                            "code": broken_code,
+                            "framework": FRAMEWORK,
+                            "error_message": broken_err,
+                            "include_explanation": True,
+                            "runtime_preferences": prefs,
+                            "client_context": {"client_type": "api"},
+                        },
+                    ),
+                    EndpointCase(
+                        name=f"chat-{variation}-{profile}",
+                        method="POST",
+                        path="/api/chat/message",
+                        expected_statuses=[200],
+                        profile=profile,
+                        json_body={
+                            "message": (
+                                f"{prompt_for(profile, variation)} "
+                                "Also state which qiskit version your response targets."
+                            ),
+                            "framework": FRAMEWORK,
+                            "detail_level": "intermediate",
+                            "new_session": True,
+                            "include_other_session_summaries": False,
+                            "runtime_preferences": prefs,
+                            "client_context": {"client_type": "api"},
+                        },
+                    ),
+                ]
+            )
+
+        for target_fw in ("pennylane", "cirq"):
+            cases.append(
+                EndpointCase(
+                    name=f"transpile-qiskit-to-{target_fw}-{profile}",
+                    method="POST",
+                    path="/api/transpile/convert",
+                    expected_statuses=[200],
+                    profile=profile,
+                    json_body={
+                        "source_code": transpile_source_qiskit(),
+                        "source_framework": FRAMEWORK,
+                        "target_framework": target_fw,
+                        "preserve_comments": True,
+                        "optimize": False,
+                        "runtime_preferences": prefs,
+                        "client_context": {"client_type": "api"},
+                    },
+                )
+            )
+    return cases
+
+
+def run_suite(
+    base_url: str,
+    token: Optional[str],
+    timeout_seconds: float,
+    auth_disabled: bool,
+    max_response_chars: int,
+) -> Dict[str, Any]:
     session = requests.Session()
     if token:
         session.headers.update({"Authorization": f"Bearer {token}"})
 
+    cases = build_cases(auth_disabled=auth_disabled)
     report: Dict[str, Any] = {
         "timestamp": now_iso(),
         "base_url": base_url,
+        "framework_scope": "qiskit",
         "auth_disabled": auth_disabled,
-        "tests": [],
+        "cases_total": len(cases),
+        "results": [],
         "summary": {},
     }
 
-    all_latencies: List[float] = []
-    endpoint_totals: Dict[str, int] = {}
-    endpoint_passed: Dict[str, int] = {}
+    latencies: List[float] = []
+    passed = 0
+    failed = 0
 
-    generation_stats: List[Dict[str, Any]] = []
-
-    def record(result: Dict[str, Any]) -> None:
-        report["tests"].append(result)
-        endpoint = result.get("endpoint", "unknown")
-        endpoint_totals[endpoint] = endpoint_totals.get(endpoint, 0) + 1
-        if result.get("status") == 200:
-            endpoint_passed[endpoint] = endpoint_passed.get(endpoint, 0) + 1
-        if isinstance(result.get("latency_ms"), (int, float)):
-            all_latencies.append(float(result["latency_ms"]))
-
-    if not auth_disabled and not token:
-        record(
-            {
-                "endpoint": "suite",
-                "scenario": "precheck",
-                "status": "SKIP",
-                "latency_ms": None,
-                "error": "auth required but token not provided",
-            }
-        )
-        report["summary"] = {"error": "auth required but token not provided"}
-        return report
-
-    # 1) Health checks
-    for endpoint in ("/", "/health", "/api/transpile/supported-conversions"):
-        response, latency_ms, error = timed_request(
-            session=session,
-            method="GET",
-            url=f"{base_url.rstrip('/')}{endpoint}",
-            timeout_seconds=timeout_seconds,
-        )
-        record(
-            {
-                "endpoint": endpoint,
-                "scenario": "basic",
-                "status": response.status_code if response is not None else "ERROR",
-                "latency_ms": round(latency_ms, 2),
-                "error": error,
-            }
-        )
-
-    # 2) Code generation matrix (framework x runtime x prompt)
-    for framework in FRAMEWORKS:
-        for runtime in RUNTIME_SCENARIOS:
-            for prompt in GENERATION_PROMPTS:
-                payload = {
-                    "prompt": prompt,
-                    "framework": framework,
-                    "include_explanation": True,
-                    "include_visualization": False,
-                    "runtime_preferences": runtime["runtime_preferences"],
-                    "client_context": {"client_type": "test_suite"},
+    for case in cases:
+        url = f"{base_url.rstrip('/')}{case.path}"
+        if case.requires_auth and not auth_disabled and not token:
+            report["results"].append(
+                {
+                    "name": case.name,
+                    "path": case.path,
+                    "method": case.method,
+                    "status": "SKIP",
+                    "reason": "auth required but no token provided",
+                    "profile": case.profile,
+                    "request": {
+                        "url": url,
+                        "json": case.json_body,
+                    },
                 }
-                response, latency_ms, error = timed_request(
-                    session=session,
-                    method="POST",
-                    url=f"{base_url.rstrip('/')}/api/code/generate",
-                    timeout_seconds=timeout_seconds,
-                    json=payload,
-                )
-                body = parse_json(response)
-                eval_meta = extract_llm_eval_metadata(body)
-                metadata = body.get("metadata", {}) if isinstance(body.get("metadata"), dict) else {}
-                grounding = eval_meta["grounding_metrics"] or {}
+            )
+            continue
 
-                result = {
-                    "endpoint": "/api/code/generate",
-                    "scenario": f"{framework}:{runtime['name']}",
-                    "framework": framework,
-                    "runtime_mode": runtime["name"],
-                    "prompt": prompt,
-                    "status": response.status_code if response is not None else "ERROR",
-                    "latency_ms": round(latency_ms, 2),
-                    "error": error,
-                    "response_validation_passed": body.get("validation_passed"),
-                    "llm_validation_passed": eval_meta["validation_passed"],
-                    "auto_repair_used": metadata.get("auto_repair_used"),
-                    "modernization_applied": metadata.get("modernization_applied"),
-                    "adaptive_chain": metadata.get("adaptive_preferred_chain"),
-                    "grounding_metrics": grounding,
-                    "hallucination_suppression_rate": grounding.get("hallucination_suppression_rate"),
-                }
-                if eval_meta["metadata_blob_if_missing"] is not None:
-                    result["metadata_blob_if_missing_llm_passed"] = eval_meta["metadata_blob_if_missing"]
-                record(result)
+        request_kwargs: Dict[str, Any] = {}
+        if case.json_body is not None:
+            request_kwargs["json"] = case.json_body
 
-                generation_stats.append(
-                    {
-                        "status": response.status_code if response is not None else None,
-                        "confidence_score": body.get("confidence_score"),
-                        "llm_validation_passed": eval_meta["validation_passed"],
-                        "hallucination_suppression_rate": grounding.get("hallucination_suppression_rate"),
-                        "raw_issue_count": grounding.get("raw_issue_count"),
-                        "grounded_issue_count": grounding.get("grounded_issue_count"),
-                        "dropped_issue_count": grounding.get("dropped_issue_count"),
-                    }
-                )
-
-    # 3) Transpile scenarios
-    transpile_scenarios = [
-        {
-            "name": "qiskit_to_pennylane",
-            "payload": {
-                "source_code": "from qiskit import QuantumCircuit\nqc=QuantumCircuit(2)\nqc.h(0)\nqc.cx(0,1)\nqc.measure_all()",
-                "source_framework": "qiskit",
-                "target_framework": "pennylane",
-                "preserve_comments": True,
-                "optimize": False,
-                "runtime_preferences": {"mode": "modern", "python_version": "3.11", "package_versions": {}},
-                "client_context": {"client_type": "test_suite"},
-            },
-        },
-        {
-            "name": "cirq_to_qiskit",
-            "payload": {
-                "source_code": "import cirq\nq0,q1=cirq.LineQubit.range(2)\ncircuit=cirq.Circuit(cirq.H(q0), cirq.CNOT(q0,q1), cirq.measure(q0,q1))",
-                "source_framework": "cirq",
-                "target_framework": "qiskit",
-                "preserve_comments": True,
-                "optimize": False,
-                "runtime_preferences": {"mode": "modern", "python_version": "3.11", "package_versions": {}},
-                "client_context": {"client_type": "test_suite"},
-            },
-        },
-    ]
-    for scenario in transpile_scenarios:
         response, latency_ms, error = timed_request(
             session=session,
-            method="POST",
-            url=f"{base_url.rstrip('/')}/api/transpile/convert",
+            method=case.method,
+            url=url,
             timeout_seconds=timeout_seconds,
-            json=scenario["payload"],
+            **request_kwargs,
         )
-        body = parse_json(response)
-        meta = body.get("metadata", {}) if isinstance(body.get("metadata"), dict) else {}
-        record(
-            {
-                "endpoint": "/api/transpile/convert",
-                "scenario": scenario["name"],
-                "status": response.status_code if response is not None else "ERROR",
-                "latency_ms": round(latency_ms, 2),
-                "error": error,
-                "validation_passed": body.get("validation_passed"),
-                "llm_validation_passed": (
-                    meta.get("validation_evaluation", {}).get("llm", {}).get("passed")
-                    if isinstance(meta.get("validation_evaluation"), dict)
-                    else None
-                ),
-            }
-        )
+        status = response.status_code if response is not None else "ERROR"
+        expected = case.expected_statuses or [200]
+        ok = response is not None and response.status_code in expected
 
-    # 4) Completion scenarios
-    completion_scenarios = [
-        {
-            "name": "qiskit_prefix",
-            "payload": {
-                "code_prefix": "from qiskit import QuantumCircuit\nqc = QuantumCircuit(2)\nqc.",
-                "framework": "qiskit",
-                "cursor_line": 3,
-                "cursor_column": 3,
-                "max_suggestions": 5,
-                "client_context": {"client_type": "test_suite"},
-            },
-        },
-        {
-            "name": "pennylane_prefix",
-            "payload": {
-                "code_prefix": "import pennylane as qml\ndev = qml.device('default.qubit', wires=2)\n@qml.qnode(dev)\ndef circuit(theta):\n    qml.",
-                "framework": "pennylane",
-                "cursor_line": 5,
-                "cursor_column": 8,
-                "max_suggestions": 5,
-                "client_context": {"client_type": "test_suite"},
-            },
-        },
-    ]
-    for scenario in completion_scenarios:
-        response, latency_ms, error = timed_request(
-            session=session,
-            method="POST",
-            url=f"{base_url.rstrip('/')}/api/complete/suggest",
-            timeout_seconds=timeout_seconds,
-            json=scenario["payload"],
-        )
-        body = parse_json(response)
-        suggestions = body.get("suggestions", []) if isinstance(body.get("suggestions"), list) else []
-        record(
-            {
-                "endpoint": "/api/complete/suggest",
-                "scenario": scenario["name"],
-                "status": response.status_code if response is not None else "ERROR",
-                "latency_ms": round(latency_ms, 2),
-                "error": error,
-                "suggestion_count": len(suggestions),
-            }
-        )
+        response_body = parse_response_body(response, max_chars=max_response_chars)
+        retrieval_info = extract_retrieval_info(response_body)
 
-    # 5) Explain scenarios
-    explain_scenarios = [
-        {
-            "name": "bell_beginner",
-            "payload": {
-                "code": "from qiskit import QuantumCircuit\nqc=QuantumCircuit(2)\nqc.h(0)\nqc.cx(0,1)\nqc.measure_all()",
-                "framework": "qiskit",
-                "detail_level": "beginner",
-                "include_math": False,
-                "include_visualization": False,
-                "client_context": {"client_type": "test_suite"},
+        entry = {
+            "name": case.name,
+            "path": case.path,
+            "method": case.method,
+            "profile": case.profile,
+            "status": status,
+            "ok": ok,
+            "expected_statuses": expected,
+            "latency_ms": round(latency_ms, 2),
+            "error": error,
+            "request": {
+                "url": url,
+                "json": case.json_body,
             },
-        },
-        {
-            "name": "ghz_advanced_math",
-            "payload": {
-                "code": "from qiskit import QuantumCircuit\nqc=QuantumCircuit(3)\nqc.h(0)\nqc.cx(0,1)\nqc.cx(0,2)\nqc.measure_all()",
-                "framework": "qiskit",
-                "detail_level": "advanced",
-                "include_math": True,
-                "include_visualization": False,
-                "client_context": {"client_type": "test_suite"},
+            "response": {
+                "headers": dict(response.headers) if response is not None else {},
+                "body": response_body,
             },
-        },
-    ]
-    for scenario in explain_scenarios:
-        response, latency_ms, error = timed_request(
-            session=session,
-            method="POST",
-            url=f"{base_url.rstrip('/')}/api/explain/code",
-            timeout_seconds=timeout_seconds,
-            json=scenario["payload"],
-        )
-        body = parse_json(response)
-        record(
-            {
-                "endpoint": "/api/explain/code",
-                "scenario": scenario["name"],
-                "status": response.status_code if response is not None else "ERROR",
-                "latency_ms": round(latency_ms, 2),
-                "error": error,
-                "has_overview": bool(body.get("overview")),
-                "has_math": bool(body.get("mathematics")),
-            }
-        )
-
-    # 6) Fix scenarios
-    fix_scenarios = [
-        {
-            "name": "qiskit_missing_arg",
-            "payload": {
-                "code": "from qiskit import QuantumCircuit\nqc=QuantumCircuit(2)\nqc.h(0)\nqc.cx(0)",
-                "framework": "qiskit",
-                "error_message": "TypeError: cx() missing 1 required positional argument",
-                "include_explanation": True,
-                "client_context": {"client_type": "test_suite"},
-            },
-        },
-        {
-            "name": "cirq_bad_gate_usage",
-            "payload": {
-                "code": "import cirq\nq=cirq.LineQubit(0)\ncircuit=cirq.Circuit()\ncircuit.append(cirq.CNOT(q))",
-                "framework": "cirq",
-                "error_message": "TypeError: CNOT expects two qubits",
-                "include_explanation": True,
-                "client_context": {"client_type": "test_suite"},
-            },
-        },
-    ]
-    for scenario in fix_scenarios:
-        response, latency_ms, error = timed_request(
-            session=session,
-            method="POST",
-            url=f"{base_url.rstrip('/')}/api/fix/code",
-            timeout_seconds=timeout_seconds,
-            json=scenario["payload"],
-        )
-        body = parse_json(response)
-        meta = body.get("metadata", {}) if isinstance(body.get("metadata"), dict) else {}
-        record(
-            {
-                "endpoint": "/api/fix/code",
-                "scenario": scenario["name"],
-                "status": response.status_code if response is not None else "ERROR",
-                "latency_ms": round(latency_ms, 2),
-                "error": error,
-                "validation_passed": meta.get("validation_passed"),
-                "llm_validation_passed": (
-                    meta.get("validation_evaluation", {}).get("llm", {}).get("passed")
-                    if isinstance(meta.get("validation_evaluation"), dict)
-                    else None
-                ),
-            }
-        )
-
-    # 7) Chat scenarios (with session continuation)
-    chat_scenarios = [
-        {
-            "name": "conceptual_intro",
-            "payload": {
-                "message": "What is quantum superposition? Explain simply.",
-                "framework": "qiskit",
-                "detail_level": "beginner",
-                "new_session": True,
-                "include_other_session_summaries": False,
-                "client_context": {"client_type": "test_suite"},
-            },
-            "capture_session": True,
-        },
-        {
-            "name": "code_followup",
-            "payload": {
-                "message": "Now give runnable qiskit code for a Bell state with measurement.",
-                "framework": "qiskit",
-                "detail_level": "intermediate",
-                "new_session": False,
-                "include_other_session_summaries": False,
-                "client_context": {"client_type": "test_suite"},
-            },
-            "use_captured_session": True,
-        },
-        {
-            "name": "math_focus",
-            "payload": {
-                "message": "Give matrix-level explanation of GHZ state and measurement probabilities.",
-                "framework": "qiskit",
-                "detail_level": "advanced",
-                "new_session": False,
-                "include_other_session_summaries": False,
-                "client_context": {"client_type": "test_suite"},
-            },
-            "use_captured_session": True,
-        },
-        {
-            "name": "legacy_version_chat",
-            "payload": {
-                "message": "Show qiskit code compatible with qiskit 0.45 style APIs.",
-                "framework": "qiskit",
-                "detail_level": "intermediate",
-                "new_session": False,
-                "include_other_session_summaries": False,
-                "runtime_preferences": {
-                    "mode": "legacy",
-                    "python_version": "3.9",
-                    "package_versions": {"qiskit": "0.45.*"},
-                    "allow_deprecated_apis": True,
-                },
-                "client_context": {"client_type": "test_suite"},
-            },
-            "use_captured_session": True,
-        },
-    ]
-    captured_session_id: Optional[str] = None
-    for scenario in chat_scenarios:
-        payload = dict(scenario["payload"])
-        if scenario.get("use_captured_session") and captured_session_id:
-            payload["session_id"] = captured_session_id
-        response, latency_ms, error = timed_request(
-            session=session,
-            method="POST",
-            url=f"{base_url.rstrip('/')}/api/chat/message",
-            timeout_seconds=timeout_seconds,
-            json=payload,
-        )
-        body = parse_json(response)
-        returned_session_id = body.get("session_id")
-        if scenario.get("capture_session") and isinstance(returned_session_id, str) and returned_session_id:
-            captured_session_id = returned_session_id
-        record(
-            {
-                "endpoint": "/api/chat/message",
-                "scenario": scenario["name"],
-                "status": response.status_code if response is not None else "ERROR",
-                "latency_ms": round(latency_ms, 2),
-                "error": error,
-                "intent": body.get("intent"),
-                "has_reply": bool(body.get("reply")),
-                "has_code_block": bool(body.get("code")),
-                "session_id": returned_session_id,
-            }
-        )
-
-    # Summary
-    executed = [t for t in report["tests"] if t.get("status") not in ("SKIP",)]
-    passed = [t for t in executed if t.get("status") == 200]
-    failed = [t for t in executed if t.get("status") != 200]
-
-    generation_success = [g for g in generation_stats if g.get("status") == 200]
-    llm_pass_observed = [g["llm_validation_passed"] for g in generation_success if isinstance(g.get("llm_validation_passed"), bool)]
-    hallucination_rates = [
-        float(g["hallucination_suppression_rate"])
-        for g in generation_success
-        if isinstance(g.get("hallucination_suppression_rate"), (int, float))
-    ]
-    raw_issue_counts = [
-        int(g["raw_issue_count"])
-        for g in generation_success
-        if isinstance(g.get("raw_issue_count"), int)
-    ]
-    grounded_issue_counts = [
-        int(g["grounded_issue_count"])
-        for g in generation_success
-        if isinstance(g.get("grounded_issue_count"), int)
-    ]
-    dropped_issue_counts = [
-        int(g["dropped_issue_count"])
-        for g in generation_success
-        if isinstance(g.get("dropped_issue_count"), int)
-    ]
-    confidence_scores = [
-        float(g["confidence_score"])
-        for g in generation_success
-        if isinstance(g.get("confidence_score"), (int, float))
-    ]
-
-    endpoint_summary: Dict[str, Dict[str, Any]] = {}
-    for endpoint, total in endpoint_totals.items():
-        ok = endpoint_passed.get(endpoint, 0)
-        endpoint_summary[endpoint] = {
-            "total": total,
-            "passed": ok,
-            "success_rate": round(float(ok) / float(total), 4) if total else 0.0,
+            "retrieval_observed": retrieval_info,
         }
+        report["results"].append(entry)
 
+        if isinstance(latency_ms, (int, float)):
+            latencies.append(float(latency_ms))
+        if ok:
+            passed += 1
+        else:
+            failed += 1
+
+    executed = [r for r in report["results"] if r.get("status") != "SKIP"]
     report["summary"] = {
-        "total_requests": len(executed),
-        "passed_requests": len(passed),
-        "failed_requests": len(failed),
-        "success_rate": round(float(len(passed)) / float(len(executed)), 4) if executed else 0.0,
-        "avg_latency_ms": round(statistics.mean(all_latencies), 2) if all_latencies else 0.0,
-        "p95_latency_ms": round(percentile(all_latencies, 0.95), 2) if all_latencies else 0.0,
-        "endpoint_summary": endpoint_summary,
-        "generation_metrics": {
-            "total_generation_requests": len(generation_stats),
-            "successful_generation_requests": len(generation_success),
-            "avg_confidence_score": round(statistics.mean(confidence_scores), 4) if confidence_scores else None,
-            "llm_validation_pass_rate": (
-                round(sum(1 for v in llm_pass_observed if v) / len(llm_pass_observed), 4)
-                if llm_pass_observed
-                else None
-            ),
-            "avg_hallucination_suppression_rate": (
-                round(statistics.mean(hallucination_rates), 4) if hallucination_rates else None
-            ),
-            "avg_raw_issue_count": round(statistics.mean(raw_issue_counts), 4) if raw_issue_counts else None,
-            "avg_grounded_issue_count": (
-                round(statistics.mean(grounded_issue_counts), 4) if grounded_issue_counts else None
-            ),
-            "avg_dropped_issue_count": (
-                round(statistics.mean(dropped_issue_counts), 4) if dropped_issue_counts else None
-            ),
-        },
-        "failures": [
-            {
-                "endpoint": item.get("endpoint"),
-                "scenario": item.get("scenario"),
-                "status": item.get("status"),
-                "error": item.get("error"),
-            }
-            for item in failed
-        ],
+        "executed": len(executed),
+        "passed": passed,
+        "failed": failed,
+        "success_rate": round((passed / len(executed)), 4) if executed else 0.0,
+        "avg_latency_ms": round(statistics.mean(latencies), 2) if latencies else 0.0,
+        "p95_latency_ms": round(percentile(latencies, 0.95), 2) if latencies else 0.0,
     }
     return report
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="QuantumCodeHub comprehensive endpoint test matrix")
+    parser = argparse.ArgumentParser(description="Qiskit-only endpoint retrieval tester")
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--token", default="")
+    parser.add_argument("--email", default="")
+    parser.add_argument("--password", default="")
     parser.add_argument("--timeout", type=float, default=120.0)
-    parser.add_argument("--output", default="quantumcodehub_test_results.json")
-    parser.add_argument(
-        "--auth-disabled",
-        action="store_true",
-        help="Force running without auth token checks",
-    )
+    parser.add_argument("--auth-disabled", action="store_true")
+    parser.add_argument("--max-response-chars", type=int, default=60000)
+    parser.add_argument("--output", default="quantumcodehub_qiskit_retrieval_results.json")
     args = parser.parse_args()
+
+    token = args.token.strip() or None
+    if not token and args.email.strip() and args.password:
+        token = login_for_token(args.base_url, args.email.strip(), args.password, args.timeout)
 
     detected_auth_disabled = detect_auth_disabled(args.base_url, args.timeout)
     auth_disabled = bool(args.auth_disabled or detected_auth_disabled)
 
-    report = run_tests(
+    report = run_suite(
         base_url=args.base_url,
-        token=args.token.strip() or None,
+        token=token,
         timeout_seconds=args.timeout,
         auth_disabled=auth_disabled,
+        max_response_chars=max(2000, int(args.max_response_chars)),
     )
 
-    with open(args.output, "w", encoding="utf-8") as file_handle:
-        json.dump(report, file_handle, indent=2)
+    out_path = args.output
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(report, fh, indent=2)
 
     print(json.dumps(report.get("summary", {}), indent=2))
-    print(f"Results saved to {args.output}")
+    print(f"Saved: {out_path}")
 
 
 if __name__ == "__main__":

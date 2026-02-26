@@ -1,9 +1,10 @@
 """
 Code transpilation service.
 """
-from typing import Dict, List
+from typing import Dict, List, Optional
 from services.llm_service import llm_service
 from services.rag_service import rag_service
+from services.rag_guardrails import ensure_rag_consistency, build_version_enforcement_context
 from ml.prompts import TranspilationPrompts
 from core.config import settings
 import logging
@@ -32,6 +33,7 @@ class TranspilerService:
         optimize: bool = False,
         compatibility_context: str = "",
         rag_query_suffix: str = "",
+        runtime_preferences: Optional[Dict] = None,
     ) -> Dict:
         """
         Transpile code from one framework to another
@@ -104,6 +106,45 @@ class TranspilerService:
                 framework=target_framework,
                 top_k=5,
                 request_source="/api/transpile/convert",
+                runtime_preferences=runtime_preferences,
+                prefer_latest_version=True,
+            )
+            if rag_results.get("error"):
+                return {
+                    "code": "",
+                    "success": False,
+                    "method": "rag",
+                    "differences": [],
+                    "warnings": [str(rag_results.get("error"))],
+                    "tokens_used": 0,
+                }
+            try:
+                ensure_rag_consistency(
+                    rag_results=rag_results,
+                    framework=target_framework,
+                    runtime_preferences=runtime_preferences or {},
+                    prefer_latest_version=True,
+                    require_documents=2,
+                    allow_unfiltered_fallback=False,
+                )
+            except Exception as rag_consistency_error:
+                return {
+                    "code": "",
+                    "success": False,
+                    "method": "rag",
+                    "differences": [],
+                    "warnings": [f"RAG consistency validation failed: {rag_consistency_error}"],
+                    "tokens_used": 0,
+                }
+
+            strict_version_context = build_version_enforcement_context(
+                framework=target_framework,
+                rag_results=rag_results,
+            )
+            effective_compatibility_context = (
+                f"{compatibility_context}\n{strict_version_context}".strip()
+                if strict_version_context
+                else compatibility_context
             )
 
             # Build transpilation prompt
@@ -113,7 +154,7 @@ class TranspilerService:
                 target_framework=target_framework,
                 rag_context=rag_results["context"],
                 compatibility_context=(
-                    f"{compatibility_context}\n"
+                    f"{effective_compatibility_context}\n"
                     f"Preserve comments: {preserve_comments}\n"
                     f"Optimize output circuit: {optimize}"
                 ).strip(),

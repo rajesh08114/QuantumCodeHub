@@ -9,6 +9,7 @@ from schemas.common import ClientContext, RuntimePreferences
 from services.runtime_compatibility import build_runtime_bundle_with_rag
 from services.llm_service import llm_service
 from services.rag_service import rag_service
+from services.rag_guardrails import ensure_rag_consistency, build_version_enforcement_context
 from services.validator_service import validator_service
 from services.adaptive_routing_service import adaptive_routing_service
 from services.modernization_service import modernization_service
@@ -98,7 +99,8 @@ async def generate_code(
         cache_key = hashlib.md5(
             (
                 f"{request.prompt}:{framework}:{request.num_qubits}:"
-                f"{runtime_bundle['cache_fingerprint']}"
+                f"{runtime_bundle['cache_fingerprint']}:"
+                f"{rag_service.get_framework_version_marker(framework)}"
             ).encode()
         ).hexdigest()
         
@@ -114,17 +116,45 @@ async def generate_code(
             framework=framework,
             top_k=5,
             request_source="/api/code/generate",
+            runtime_preferences=runtime_bundle.get("requested_runtime", {}),
+            prefer_latest_version=True,
         )
-        
+        if rag_results.get("error"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"RAG retrieval failed for framework '{framework}': {rag_results.get('error')}",
+            )
+        try:
+            rag_guard = ensure_rag_consistency(
+                rag_results=rag_results,
+                framework=framework,
+                runtime_preferences=runtime_bundle.get("requested_runtime", {}),
+                prefer_latest_version=True,
+                require_documents=2,
+                allow_unfiltered_fallback=False,
+            )
+        except Exception as rag_consistency_error:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"RAG consistency validation failed for framework '{framework}': {rag_consistency_error}",
+            )
+
         # Step 2: Build prompt
         system_message = CodeGenerationPrompts.get_system_message(framework)
+        strict_version_context = build_version_enforcement_context(
+            framework=framework,
+            rag_results=rag_results,
+        )
+        compatibility_context = runtime_bundle["compatibility_context"]
+        if strict_version_context:
+            compatibility_context = f"{compatibility_context}\n{strict_version_context}".strip()
         user_prompt = CodeGenerationPrompts.build_generation_prompt(
             user_query=request.prompt,
             framework=framework,
             rag_context=rag_results["context"],
             num_qubits=request.num_qubits,
             include_explanation=request.include_explanation,
-            compatibility_context=runtime_bundle["compatibility_context"],
+            compatibility_context=compatibility_context,
         )
 
         generation_max_tokens = _resolve_generation_max_tokens(
@@ -163,7 +193,8 @@ async def generate_code(
             framework=framework,
             user_query=request.prompt,
             rag_context=rag_results.get("context", ""),
-            compatibility_context=runtime_bundle["compatibility_context"],
+            compatibility_context=compatibility_context,
+            runtime_preferences=runtime_bundle.get("requested_runtime", {}),
         )
 
         repair_result = None
@@ -176,7 +207,7 @@ async def generate_code(
                 user_query=request.prompt,
                 validation_errors=validation_result.get("errors", []),
                 rag_context=rag_results.get("context", ""),
-                compatibility_context=runtime_bundle["compatibility_context"],
+                compatibility_context=compatibility_context,
                 runtime_preferences=runtime_bundle.get("requested_runtime"),
                 preferred_chain=preferred_chain,
             )
@@ -208,7 +239,7 @@ async def generate_code(
                 validation_result=validation_result,
                 user_query=request.prompt,
                 rag_context=rag_results.get("context", ""),
-                compatibility_context=runtime_bundle["compatibility_context"],
+                compatibility_context=compatibility_context,
                 preferred_chain=preferred_chain,
             )
             if modernization_result.get("applied"):
@@ -276,6 +307,11 @@ async def generate_code(
                 "runtime_recommendations": runtime_bundle["runtime_recommendations"],
                 "version_conflicts": runtime_bundle["version_conflicts"],
                 "runtime_validation": runtime_bundle["runtime_validation"],
+                "rag_version": {
+                    "selected_version": rag_guard.get("selected_version", ""),
+                    "latest_version": rag_guard.get("latest_version", ""),
+                    "strategy": rag_guard.get("strategy", ""),
+                },
             }
         }
         
@@ -408,6 +444,7 @@ async def _attempt_auto_repair(
     validation_errors: List[str],
     rag_context: str,
     compatibility_context: str,
+    runtime_preferences: Optional[dict] = None,
     preferred_chain: Optional[List[str]] = None,
 ) -> Optional[dict]:
     error_message = "\n".join(validation_errors[:8])
@@ -436,6 +473,7 @@ async def _attempt_auto_repair(
         user_query=user_query,
         rag_context=rag_context,
         compatibility_context=compatibility_context,
+        runtime_preferences=runtime_preferences or {},
     )
     return {
         "code": repaired_code,

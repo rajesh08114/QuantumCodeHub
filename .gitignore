@@ -45,9 +45,13 @@ logs/
 *.seed
 *.out
 *.err
+*.tmp
+*.temp
 
 # Local data stores and vector DB artifacts
 Rag_pipeline/
+chroma_db/
+quantum_rag_db/
 
 # IDE/editor files
 .vscode/
@@ -58,8 +62,31 @@ Rag_pipeline/
 .DS_Store
 Thumbs.db
 
+# JSON artifacts (ignore all JSON by request)
+*.json
+
+# Local archives and scratch files
+*.zip
+*.7z
+*.bak
+*.orig
+.cache/
+.tmp/
+.venv_latest/
+
 
 Rag_pipeline.zip
 
 
 quantumcodehub_test_results.json
+*_test_results.json
+
+scripts/list_versions.py
+scripts/list_documents.py
+scripts/ingest_quantum_textbooks.py
+scripts/ingest_qiskit_web.py
+scripts/ingest_multi_framework_web.py
+scripts/backfill_chroma_metadata.py
+
+
+Rag_pipeline/chroma_docs

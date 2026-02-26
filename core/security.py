@@ -3,10 +3,11 @@ JWT and password hashing.
 """
 from datetime import datetime, timedelta
 from typing import Optional
+import secrets
 import bcrypt
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, status, Request
 from fastapi.security import OAuth2PasswordBearer
 from core.config import settings
 import logging
@@ -135,7 +136,10 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
     payload = decode_access_token(token)
     return _user_from_payload(payload)
 
-async def get_current_active_user(token: Optional[str] = Depends(oauth2_scheme_optional)) -> dict:
+async def get_current_active_user(
+    request: Request,
+    token: Optional[str] = Depends(oauth2_scheme_optional),
+) -> dict:
     """Dependency to ensure user is active"""
     if not settings.ENABLE_AUTH:
         # Test-mode user when auth is disabled.
@@ -145,6 +149,17 @@ async def get_current_active_user(token: Optional[str] = Depends(oauth2_scheme_o
             "subscription_tier": "enterprise",
             "auth_disabled": True,
         }
+
+    internal_expected = (settings.INTERNAL_API_KEY or "").strip()
+    if internal_expected:
+        provided = (request.headers.get("x-internal-api-key") or "").strip()
+        if provided and secrets.compare_digest(provided, internal_expected):
+            return {
+                "user_id": "internal_service",
+                "email": "internal@service.local",
+                "subscription_tier": "enterprise",
+                "auth_mode": "internal_api_key",
+            }
 
     if not token:
         raise _credentials_exception()

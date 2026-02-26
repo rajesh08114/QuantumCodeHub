@@ -11,6 +11,7 @@ from services.cache_service import cache_service
 from services.validator_service import validator_service
 from services.modernization_service import modernization_service
 from services.runtime_compatibility import build_runtime_bundle_with_rag
+from services.rag_service import rag_service
 from core.security import get_current_active_user
 from core.config import settings
 import time
@@ -100,7 +101,8 @@ async def transpile_code(
         cache_key = hashlib.md5(
             (
                 f"{source_code}:{source_framework}:{target_framework}:"
-                f"{runtime_bundle['cache_fingerprint']}"
+                f"{runtime_bundle['cache_fingerprint']}:"
+                f"{rag_service.get_framework_version_marker(target_framework)}"
             ).encode()
         ).hexdigest()
 
@@ -118,6 +120,7 @@ async def transpile_code(
             optimize=request.optimize,
             compatibility_context=runtime_bundle["compatibility_context"],
             rag_query_suffix=runtime_bundle["rag_query_suffix"],
+            runtime_preferences=runtime_bundle.get("requested_runtime", {}),
         )
 
         if not transpilation_result.get("success", False):
@@ -136,6 +139,7 @@ async def transpile_code(
                 f"Transpile {source_framework} to {target_framework} while preserving behavior."
             ),
             compatibility_context=runtime_bundle["compatibility_context"],
+            runtime_preferences=runtime_bundle.get("requested_runtime", {}),
         )
 
         modernization_result = {

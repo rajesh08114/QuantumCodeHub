@@ -15,6 +15,7 @@ from ml.prompts import ChatbotPrompts
 from services.chat_memory_service import chat_memory_service
 from services.llm_service import llm_service
 from services.rag_service import rag_service
+from services.rag_guardrails import ensure_rag_consistency, build_version_enforcement_context
 from services.runtime_compatibility import build_runtime_bundle_with_rag
 from schemas.common import ClientContext, RuntimePreferences
 
@@ -232,7 +233,39 @@ async def chat_message(
             framework=rag_framework,
             top_k=6,
             request_source="/api/chat/message",
+            runtime_preferences=runtime_bundle.get("requested_runtime", {}),
+            prefer_latest_version=True,
         )
+        if rag_results.get("error"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"RAG retrieval failed for framework '{rag_framework}': {rag_results.get('error')}",
+            )
+        if rag_framework in VALID_FRAMEWORKS:
+            try:
+                rag_guard = ensure_rag_consistency(
+                    rag_results=rag_results,
+                    framework=rag_framework,
+                    runtime_preferences=runtime_bundle.get("requested_runtime", {}),
+                    prefer_latest_version=True,
+                    require_documents=1,
+                    allow_unfiltered_fallback=False,
+                )
+            except Exception as rag_consistency_error:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"RAG consistency validation failed for framework '{rag_framework}': {rag_consistency_error}",
+                )
+        else:
+            rag_guard = {"selected_version": "", "latest_version": "", "strategy": ""}
+
+        strict_version_context = build_version_enforcement_context(
+            framework=rag_framework,
+            rag_results=rag_results,
+        )
+        compatibility_context = runtime_bundle["compatibility_context"]
+        if strict_version_context:
+            compatibility_context = f"{compatibility_context}\n{strict_version_context}".strip()
 
         prompt = ChatbotPrompts.build_general_prompt(
             framework=rag_framework,
@@ -240,7 +273,7 @@ async def chat_message(
             rag_context=rag_results.get("context", ""),
             conversation_context=session_context,
             cross_session_summary=cross_session_context,
-            compatibility_context=runtime_bundle["compatibility_context"],
+            compatibility_context=compatibility_context,
             math_focus=math_focus,
         )
 
@@ -311,6 +344,11 @@ async def chat_message(
                 "runtime_recommendations": runtime_bundle["runtime_recommendations"],
                 "version_conflicts": runtime_bundle["version_conflicts"],
                 "runtime_validation": runtime_bundle["runtime_validation"],
+                "rag_version": {
+                    "selected_version": rag_guard.get("selected_version", ""),
+                    "latest_version": rag_guard.get("latest_version", ""),
+                    "strategy": rag_guard.get("strategy", ""),
+                },
                 "latency_ms": int((time.time() - start) * 1000),
             },
         }

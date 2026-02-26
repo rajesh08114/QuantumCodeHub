@@ -654,6 +654,7 @@ async def build_runtime_bundle_with_rag(
     try:
         from services.llm_service import llm_service
         from services.rag_service import rag_service
+        from services.rag_guardrails import ensure_rag_consistency
     except Exception as import_error:
         logger.warning("Runtime recommendation services unavailable: %s", import_error)
         bundle["runtime_validation"]["status"] = _status_with_runtime_request(
@@ -675,7 +676,40 @@ async def build_runtime_bundle_with_rag(
             framework=safe_framework,
             top_k=6,
             request_source=f"{request_source}#runtime_recommendation",
+            runtime_preferences=bundle.get("requested_runtime", {}),
+            prefer_latest_version=True,
         )
+        rag_error = str(rag_results.get("error") or "").strip()
+        if rag_error:
+            bundle["runtime_validation"]["status"] = _status_with_runtime_request(
+                bundle,
+                "rag_retrieval_error",
+            )
+            bundle["runtime_validation"]["error"] = rag_error
+            bundle["compatibility_context"] = _build_compatibility_context(bundle, safe_framework)
+            bundle["rag_query_suffix"] = _build_rag_query_suffix(bundle, safe_framework)
+            bundle["cache_fingerprint"] = _build_cache_fingerprint(bundle, safe_framework)
+            return bundle
+        try:
+            ensure_rag_consistency(
+                rag_results=rag_results,
+                framework=safe_framework,
+                runtime_preferences=bundle.get("requested_runtime", {}),
+                prefer_latest_version=True,
+                require_documents=2,
+                allow_unfiltered_fallback=False,
+            )
+        except Exception as rag_consistency_error:
+            bundle["runtime_validation"]["status"] = _status_with_runtime_request(
+                bundle,
+                "rag_consistency_failed",
+            )
+            bundle["runtime_validation"]["error"] = str(rag_consistency_error)
+            bundle["compatibility_context"] = _build_compatibility_context(bundle, safe_framework)
+            bundle["rag_query_suffix"] = _build_rag_query_suffix(bundle, safe_framework)
+            bundle["cache_fingerprint"] = _build_cache_fingerprint(bundle, safe_framework)
+            return bundle
+
         documents = rag_results.get("documents", []) or []
         bundle["runtime_validation"]["documents_used"] = len(documents)
         bundle["runtime_validation"]["rag_average_score"] = rag_results.get("average_score", 0.0)

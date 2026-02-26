@@ -38,7 +38,8 @@ class Settings(BaseSettings):
     SECRET_KEY: str
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
-    ENABLE_AUTH: bool = True
+    ENABLE_AUTH: bool = False
+    INTERNAL_API_KEY: str = ""
 
     # -----------------------
     # LLM Service
@@ -83,6 +84,10 @@ class Settings(BaseSettings):
     RAG_TOP_K: int = 5
     CHROMA_PERSIST_DIR: str = "Rag_pipeline/chroma_db"
     CHROMA_COLLECTION_NAME: str = "quantum_knowledge"
+    RAG_DEFAULT_TO_LATEST_VERSION: bool = True
+    RAG_LATEST_VERSION_CACHE_TTL_SECONDS: int = 600
+    RAG_LEGACY_MODE_ALLOW_ALL_VERSIONS: bool = True
+    RAG_STRICT_VERSION_SELECTION: bool = True
     RAG_TRAFFIC_PROFILE: str = "auto"  # auto | code_heavy | balanced | conceptual
     RAG_FETCH_MULTIPLIER: int = 12
     RAG_MAX_FETCH_RESULTS: int = 200

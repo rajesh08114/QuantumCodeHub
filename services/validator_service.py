@@ -6,7 +6,7 @@ from ml.validators.pennylane_validator import PennyLaneValidator
 from ml.validators.cirq_validator import CirqValidator
 from ml.validators.torchquantum_validator import TorchQuantumValidator
 from ml.validators.base_validator import BaseValidator
-from typing import Dict
+from typing import Dict, Optional
 import logging
 
 from core.config import settings
@@ -44,6 +44,7 @@ class ValidatorService:
         user_query: str = "",
         rag_context: str = "",
         compatibility_context: str = "",
+        runtime_preferences: Optional[Dict] = None,
     ) -> Dict:
         """
         Validate code for specific framework
@@ -101,14 +102,40 @@ class ValidatorService:
                 if should_fetch_validation_rag:
                     try:
                         from services.rag_service import rag_service
+                        from services.rag_guardrails import ensure_rag_consistency
 
                         rag_payload = await rag_service.retrieve_context(
                             query=_build_validation_rag_query(framework, user_query, code),
                             framework=framework,
                             top_k=max(1, int(settings.VALIDATION_RAG_TOP_K or 3)),
                             request_source="/validation/llm",
+                            runtime_preferences=runtime_preferences,
+                            prefer_latest_version=True,
                         )
                         retrieved_context = (rag_payload.get("context") or "").strip()
+                        rag_error = str(rag_payload.get("error") or "").strip()
+                        if rag_error:
+                            logger.warning(
+                                "Validation RAG strict retrieval error framework=%s error=%s",
+                                framework,
+                                rag_error,
+                            )
+                        else:
+                            try:
+                                ensure_rag_consistency(
+                                    rag_results=rag_payload,
+                                    framework=framework,
+                                    runtime_preferences=runtime_preferences,
+                                    prefer_latest_version=True,
+                                    require_documents=1,
+                                    allow_unfiltered_fallback=False,
+                                )
+                            except Exception as rag_consistency_error:
+                                logger.warning(
+                                    "Validation RAG consistency failed framework=%s error=%s",
+                                    framework,
+                                    rag_consistency_error,
+                                )
                         if retrieved_context:
                             if validation_rag_context and settings.VALIDATION_RAG_AUGMENT_WHEN_CONTEXT_PRESENT:
                                 validation_rag_context = (

@@ -8,6 +8,7 @@ from typing import Optional
 from schemas.common import ClientContext, RuntimePreferences
 from services.llm_service import llm_service
 from services.rag_service import rag_service
+from services.rag_guardrails import ensure_rag_consistency, build_version_enforcement_context
 from services.runtime_compatibility import build_runtime_bundle_with_rag
 from ml.prompts import ExplanationPrompts
 from core.config import settings
@@ -17,6 +18,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/explain", tags=["Code Explanation"])
+VALID_FRAMEWORKS = {"qiskit", "pennylane", "cirq", "torchquantum"}
 
 class ExplanationRequest(BaseModel):
     code: str = Field(..., description="Code to explain")
@@ -71,8 +73,15 @@ async def explain_code(
     ```
     """
     try:
+        framework = (request.framework or "").strip().lower()
+        if framework not in VALID_FRAMEWORKS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid framework. Must be one of: {sorted(VALID_FRAMEWORKS)}",
+            )
+
         runtime_bundle = await build_runtime_bundle_with_rag(
-            framework=request.framework,
+            framework=framework,
             client_context=request.client_context,
             runtime_preferences=request.runtime_preferences,
             request_source="/api/explain/code",
@@ -84,18 +93,46 @@ async def explain_code(
                 f"Explain this {request.framework} code:\n{request.code}\n\n"
                 f"{runtime_bundle['rag_query_suffix']}"
             ),
-            framework=request.framework,
+            framework=framework,
             top_k=3,
             request_source="/api/explain/code",
+            runtime_preferences=runtime_bundle.get("requested_runtime", {}),
+            prefer_latest_version=True,
         )
+        if rag_results.get("error"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"RAG retrieval failed for framework '{framework}': {rag_results.get('error')}",
+            )
+        try:
+            ensure_rag_consistency(
+                rag_results=rag_results,
+                framework=framework,
+                runtime_preferences=runtime_bundle.get("requested_runtime", {}),
+                prefer_latest_version=True,
+                require_documents=1,
+                allow_unfiltered_fallback=False,
+            )
+        except Exception as rag_consistency_error:
+            raise HTTPException(
+                status_code=400,
+                detail=f"RAG consistency validation failed for framework '{framework}': {rag_consistency_error}",
+            )
+        strict_version_context = build_version_enforcement_context(
+            framework=framework,
+            rag_results=rag_results,
+        )
+        compatibility_context = runtime_bundle["compatibility_context"]
+        if strict_version_context:
+            compatibility_context = f"{compatibility_context}\n{strict_version_context}".strip()
         
         # Build explanation prompt
         prompt = ExplanationPrompts.build_explanation_prompt(
             code=request.code,
-            framework=request.framework,
+            framework=framework,
             detail_level=request.detail_level,
             rag_context=rag_results.get("context", ""),
-            compatibility_context=runtime_bundle["compatibility_context"],
+            compatibility_context=compatibility_context,
         )
         
         # Generate explanation

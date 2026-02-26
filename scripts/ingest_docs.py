@@ -56,9 +56,22 @@ class DocumentIngestion:
                     source = str(doc.get("source", "")).strip() or f"local://{framework}/{json_file.name}"
                     if "://" not in source:
                         source = f"local://{framework}/{source}"
+                    try:
+                        layer_value = int(doc.get("layer", 1))
+                    except (TypeError, ValueError):
+                        layer_value = 1
+                    try:
+                        priority_value = int(doc.get("priority", 2))
+                    except (TypeError, ValueError):
+                        priority_value = 2
 
                     metadata = {
                         "source": source,
+                        "url": source if "://" in source else "",
+                        "path": str(doc.get("path", "")),
+                        "source_type": str(doc.get("source_type", "official_docs")),
+                        "layer": layer_value,
+                        "priority": priority_value,
                         "section": str(doc.get("section", "general")),
                         "framework": framework,
                         "version": str(doc.get("version", "latest")),

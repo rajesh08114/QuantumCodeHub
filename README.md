@@ -84,6 +84,10 @@ Recommended quality controls:
 - `VALIDATION_LLM_ON_STATIC_PASS_ONLY=true`
 - `VALIDATION_USE_RAG=true`
 - `VALIDATION_RAG_TOP_K=3`
+- `RAG_DEFAULT_TO_LATEST_VERSION=true`
+- `RAG_LATEST_VERSION_CACHE_TTL_SECONDS=600`
+- `RAG_LEGACY_MODE_ALLOW_ALL_VERSIONS=true`
+- `RAG_STRICT_VERSION_SELECTION=true`
 - `VALIDATION_MAX_CODE_CHARS=2400`
 - `VALIDATION_MAX_RAG_CHARS=1200`
 - `VALIDATION_MAX_COMPATIBILITY_CHARS=700`
@@ -124,8 +128,21 @@ Open:
 
 ## 4. Auth Behavior
 
-- `ENABLE_AUTH=true`: protected routes need `Authorization: Bearer <token>`.
-- `ENABLE_AUTH=false`: protected routes can be called without JWT (test mode).
+- `ENABLE_AUTH=false` (recommended local default): protected routes can be called without JWT.
+- `ENABLE_AUTH=true`: protected routes need `Authorization: Bearer <token>` unless internal key is configured.
+- `INTERNAL_API_KEY=<value>`: protected routes also accept `X-Internal-API-Key: <value>` for trusted service-to-service calls.
+
+### 4.1 Research Platform Integration
+
+If `research_platform` should delegate `research_type=quantum` to this backend:
+1. Run this backend on a reachable URL (example `http://127.0.0.1:8001`).
+2. Configure `research_platform/.env`:
+   - `CODEHUB_USE_FOR_QUANTUM=true`
+   - `CODEHUB_BACKEND_BASE_URL=http://127.0.0.1:8001`
+   - `CODEHUB_GENERATE_ENDPOINT=/api/code/generate`
+   - `CODEHUB_INTERNAL_API_KEY=<same as INTERNAL_API_KEY>` (optional)
+   - `CODEHUB_BEARER_TOKEN=<JWT>` (optional)
+3. Keep one LLM provider configured in this backend (`HF_API_KEY` or `RESP_API_URL` or `OLLAMA_*`).
 
 ## 5. Postman Testing Guide
 
@@ -289,15 +306,32 @@ python test.py --email your@email.com --password YourPassword123!
 python test.py --base-url http://127.0.0.1:8000 --timeout 90 --fail-on-error
 ```
 
+Framework matrix + subprocess compile checks:
+
+```bash
+python test.py --framework-matrix --code-subprocess-timeout 10 --fail-on-error
+```
+
+Compile + execute generated code (stricter):
+
+```bash
+python test.py --framework-matrix --execute-generated-code --code-subprocess-timeout 12 --fail-on-error
+```
+
 - `--base-url`: API host
 - `--timeout`: per-request timeout seconds
 - `--fail-on-error`: exits with code `1` if any executed endpoint fails
+- `--framework-matrix`: add generation checks across qiskit/pennylane/cirq/torchquantum
+- `--skip-code-validation`: disable subprocess compile validation
+- `--execute-generated-code`: run generated code after compile validation
+- `--code-subprocess-timeout`: timeout seconds for compile/execute subprocess checks
 
 The script prints:
 - status per endpoint
 - per-endpoint latency (ms)
 - summary (passed/failed/skipped)
 - average and p95 latency
+- and writes one JSON report (`quantumcodehub_test_results.json` by default) containing each request body and response body.
 
 ## 7. Troubleshooting
 

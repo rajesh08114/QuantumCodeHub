@@ -14,6 +14,7 @@ from core.security import get_current_active_user
 from ml.prompts import CodeGenerationPrompts, ErrorFixingPrompts
 from services.llm_service import llm_service
 from services.rag_service import rag_service
+from services.rag_guardrails import ensure_rag_consistency, build_version_enforcement_context
 from services.runtime_compatibility import build_runtime_bundle_with_rag
 from services.validator_service import validator_service
 from services.modernization_service import modernization_service
@@ -178,14 +179,43 @@ async def fix_code(
             framework=framework,
             top_k=5,
             request_source="/api/fix/code",
+            runtime_preferences=runtime_bundle.get("requested_runtime", {}),
+            prefer_latest_version=True,
         )
+        if rag_results.get("error"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"RAG retrieval failed for framework '{framework}': {rag_results.get('error')}",
+            )
+        try:
+            rag_guard = ensure_rag_consistency(
+                rag_results=rag_results,
+                framework=framework,
+                runtime_preferences=runtime_bundle.get("requested_runtime", {}),
+                prefer_latest_version=True,
+                require_documents=2,
+                allow_unfiltered_fallback=False,
+            )
+        except Exception as rag_consistency_error:
+            raise HTTPException(
+                status_code=400,
+                detail=f"RAG consistency validation failed for framework '{framework}': {rag_consistency_error}",
+            )
+
+        strict_version_context = build_version_enforcement_context(
+            framework=framework,
+            rag_results=rag_results,
+        )
+        compatibility_context = runtime_bundle["compatibility_context"]
+        if strict_version_context:
+            compatibility_context = f"{compatibility_context}\n{strict_version_context}".strip()
 
         prompt = ErrorFixingPrompts.build_error_fixing_prompt(
             code=source_code,
             framework=framework,
             error_message=error_message,
             rag_context=rag_results.get("context", ""),
-            compatibility_context=runtime_bundle["compatibility_context"],
+            compatibility_context=compatibility_context,
         )
 
         llm_response = await llm_service.generate_code(
@@ -212,7 +242,8 @@ async def fix_code(
             framework=framework,
             user_query=(error_message or f"Fix {framework} code errors and return runnable code."),
             rag_context=rag_results.get("context", ""),
-            compatibility_context=runtime_bundle["compatibility_context"],
+            compatibility_context=compatibility_context,
+            runtime_preferences=runtime_bundle.get("requested_runtime", {}),
         )
 
         modernization_result = {
@@ -232,7 +263,7 @@ async def fix_code(
                 validation_result=validation_result,
                 user_query=(error_message or "Modernize fixed code to stable APIs."),
                 rag_context=rag_results.get("context", ""),
-                compatibility_context=runtime_bundle["compatibility_context"],
+                compatibility_context=compatibility_context,
                 runtime_preferences=runtime_bundle.get("requested_runtime"),
             )
             if modernization_result.get("applied"):
@@ -275,6 +306,11 @@ async def fix_code(
                 "runtime_recommendations": runtime_bundle["runtime_recommendations"],
                 "version_conflicts": runtime_bundle["version_conflicts"],
                 "runtime_validation": runtime_bundle["runtime_validation"],
+                "rag_version": {
+                    "selected_version": rag_guard.get("selected_version", ""),
+                    "latest_version": rag_guard.get("latest_version", ""),
+                    "strategy": rag_guard.get("strategy", ""),
+                },
             },
         }
         return response

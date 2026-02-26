@@ -163,6 +163,7 @@ class ModernizationService:
                 user_query=user_query,
                 rag_context=rag_context,
                 compatibility_context=compatibility_context,
+                runtime_preferences=prefs,
             )
 
             before_errors = _error_count(validation_result)
