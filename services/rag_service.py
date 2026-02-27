@@ -60,6 +60,7 @@ class RAGService:
         "torchquantum",
         "tensorflow_quantum",
     }
+    _IBM_API_DATASET = "ibm_quantum_api_docs"
 
     def __init__(self):
         self.top_k = settings.RAG_TOP_K or 5
@@ -879,6 +880,19 @@ class RAGService:
             or "unknown"
         ).lower()
 
+    def _is_preferred_ibm_api_doc(self, doc: Dict) -> bool:
+        metadata = self._normalize_metadata(doc.get("metadata") or {})
+        dataset = str(metadata.get("dataset", "")).strip().lower()
+        if dataset == self._IBM_API_DATASET:
+            return True
+
+        source = str(doc.get("source") or metadata.get("source") or "").strip().lower()
+        if "quantum.cloud.ibm.com/docs/en/api" in source:
+            return True
+
+        url = str(metadata.get("url", "")).strip().lower()
+        return "quantum.cloud.ibm.com/docs/en/api" in url
+
     def _lexical_score(self, query_terms: List[str], doc: Dict) -> float:
         if not query_terms:
             return 0.0
@@ -1288,11 +1302,19 @@ class RAGService:
                 if thresholded:
                     candidate_docs = thresholded
 
+            preferred_candidates = [
+                doc for doc in candidate_docs if self._is_preferred_ibm_api_doc(doc)
+            ]
+            non_preferred_candidates = [
+                doc for doc in candidate_docs if not self._is_preferred_ibm_api_doc(doc)
+            ]
+            ordered_candidates = preferred_candidates + non_preferred_candidates
+
             selected: List[Dict] = []
             source_counts = defaultdict(int)
             seen_signatures = set()
 
-            for doc in candidate_docs:
+            for doc in ordered_candidates:
                 source_key = self._source_key(doc)
                 signature = self._query_preview(doc.get("content", "").lower(), max_len=260)
                 if signature in seen_signatures:
@@ -1332,6 +1354,10 @@ class RAGService:
                     "query_variants": query_variants,
                     "candidate_count": len(all_candidates),
                     "framework_candidate_count": len(framework_candidates),
+                    "preferred_candidate_count": len(preferred_candidates),
+                    "preferred_selected_count": len(
+                        [doc for doc in selected if self._is_preferred_ibm_api_doc(doc)]
+                    ),
                     "selected_count": len(selected),
                     "fetch_limit": fetch_limit,
                     "weights": {
