@@ -13,6 +13,7 @@ from services.runtime_compatibility import build_runtime_bundle_with_rag
 from ml.prompts import CompletionPrompts
 from core.config import settings
 from core.security import get_current_active_user
+from utils.domain_classifier import is_quantum_domain_text
 import time
 import logging
 
@@ -66,17 +67,24 @@ async def get_completions(
 
     try:
         framework = _normalize_framework_name(request.framework)
+        code_prefix = (request.code_prefix or "").rstrip()
+
+        if not code_prefix:
+            raise HTTPException(status_code=400, detail="code_prefix is required")
+        if not is_quantum_domain_text(code_prefix):
+            logger.warning(
+                "Non-quantum domain request blocked endpoint=/api/complete/suggest field=code_prefix preview=%s",
+                " ".join(code_prefix.split())[:220],
+            )
+            raise HTTPException(status_code=400, detail="not quantum domain")
+
         runtime_bundle = await build_runtime_bundle_with_rag(
             framework=framework,
             client_context=request.client_context,
             runtime_preferences=request.runtime_preferences,
             request_source="/api/complete/suggest",
         )
-        code_prefix = (request.code_prefix or "").rstrip()
         max_suggestions = max(1, min(request.max_suggestions, 10))
-
-        if not code_prefix:
-            raise HTTPException(status_code=400, detail="code_prefix is required")
 
         # Analyze code context
         context = analyze_code_context(

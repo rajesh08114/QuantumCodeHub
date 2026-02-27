@@ -14,6 +14,7 @@ from services.runtime_compatibility import build_runtime_bundle_with_rag
 from services.rag_service import rag_service
 from core.security import get_current_active_user
 from core.config import settings
+from utils.domain_classifier import is_quantum_domain_text
 import time
 import hashlib
 import logging
@@ -80,12 +81,6 @@ async def transpile_code(
         source_framework = _normalize_framework_name(request.source_framework)
         target_framework = _normalize_framework_name(request.target_framework)
         source_code = _clean_source_code(request.source_code)
-        runtime_bundle = await build_runtime_bundle_with_rag(
-            framework=target_framework,
-            client_context=request.client_context,
-            runtime_preferences=request.runtime_preferences,
-            request_source="/api/transpile/convert",
-        )
 
         # Only required-field checks (no pre-syntax validation)
         if not source_code:
@@ -96,6 +91,19 @@ async def transpile_code(
             raise HTTPException(status_code=400, detail="target_framework is required")
         if source_framework == target_framework:
             raise HTTPException(400, "source_framework and target_framework must be different")
+        if not is_quantum_domain_text(source_code):
+            logger.warning(
+                "Non-quantum domain request blocked endpoint=/api/transpile/convert field=source_code preview=%s",
+                " ".join(source_code.split())[:220],
+            )
+            raise HTTPException(status_code=400, detail="not quantum domain")
+
+        runtime_bundle = await build_runtime_bundle_with_rag(
+            framework=target_framework,
+            client_context=request.client_context,
+            runtime_preferences=request.runtime_preferences,
+            request_source="/api/transpile/convert",
+        )
 
         # Check cache
         cache_key = hashlib.md5(

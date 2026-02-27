@@ -12,6 +12,7 @@ from pydantic import AliasChoices, BaseModel, Field
 from core.config import settings
 from core.security import get_current_active_user
 from ml.prompts import ChatbotPrompts
+from scripts.quantum_regex import is_quantum_text
 from services.chat_memory_service import chat_memory_service
 from services.llm_service import llm_service
 from services.rag_service import rag_service
@@ -141,6 +142,37 @@ def _build_retrieval_query(
     )
 
 
+def _is_quantum_domain_query(query: str) -> bool:
+    text = (query or "").strip()
+    if not text:
+        return False
+
+    try:
+        if is_quantum_text(text):
+            return True
+    except Exception as classifier_error:
+        logger.warning("Quantum domain classifier failed: %s", classifier_error)
+
+    # Conservative fallback for resilience if regex classification fails.
+    fallback_tokens = (
+        "qubit",
+        "quantum",
+        "qiskit",
+        "pennylane",
+        "cirq",
+        "torchquantum",
+        "openqasm",
+        "hadamard",
+        "cnot",
+        "grover",
+        "shor",
+        "vqe",
+        "qaoa",
+    )
+    lowered = text.lower()
+    return any(token in lowered for token in fallback_tokens)
+
+
 @router.post("/message", response_model=ChatResponse)
 async def chat_message(
     request: ChatRequest,
@@ -157,17 +189,18 @@ async def chat_message(
         if not query:
             raise HTTPException(status_code=400, detail="query is required")
 
+        is_quantum_domain = _is_quantum_domain_query(query)
         detected_framework = _detect_framework(query, request.framework)
         rag_framework = detected_framework if detected_framework in VALID_FRAMEWORKS else "general"
         runtime_framework = detected_framework if detected_framework in VALID_FRAMEWORKS else "qiskit"
         math_focus = _is_math_focused_query(query, request.detail_level)
 
-        runtime_bundle = await build_runtime_bundle_with_rag(
-            framework=runtime_framework,
-            client_context=request.client_context,
-            runtime_preferences=request.runtime_preferences,
-            request_source="/api/chat/message",
-        )
+        if not is_quantum_domain:
+            logger.warning(
+                "Non-quantum domain query detected source=/api/chat/message framework_detected=%s query_preview=%s",
+                rag_framework,
+                " ".join(query.split())[:220],
+            )
 
         # Session memory bootstrap.
         user_id = current_user.get("user_id")
@@ -219,6 +252,104 @@ async def chat_message(
             user_query=query,
             session_context=session_context,
             cross_session_context=cross_session_context,
+        )
+
+        if not is_quantum_domain:
+            direct_prompt = ChatbotPrompts.build_non_quantum_advanced_prompt(
+                user_question=query,
+                detail_level=request.detail_level,
+                conversation_context=session_context,
+                cross_session_summary=cross_session_context,
+            )
+            direct_llm = await llm_service.generate_code(
+                prompt=direct_prompt,
+                max_tokens=max(int(settings.CHAT_GENERAL_MAX_TOKENS or 900), 1200),
+                temperature=0.2,
+            )
+            logger.info(
+                "Chat direct LLM response provider=%s model=%s tokens=%s fallback_used=%s",
+                direct_llm.get("provider"),
+                direct_llm.get("model"),
+                direct_llm.get("tokens_used"),
+                direct_llm.get("fallback_used", False),
+            )
+
+            reply = (direct_llm.get("generated_text") or "").strip()
+            if not reply:
+                reply = "I could not generate a response. Please try rephrasing your question."
+
+            code_block = _extract_code_block(reply)
+            non_quantum_warning = (
+                "Query detected as non-quantum domain. Skipped RAG and runtime-compatibility retrieval; "
+                "used direct LLM response path."
+            )
+
+            if memory_enabled and user_id and session_id:
+                try:
+                    await chat_memory_service.store_message(
+                        user_id=user_id,
+                        session_id=session_id,
+                        role="assistant",
+                        content=reply,
+                        intent="general",
+                        framework="general",
+                        metadata={
+                            "provider": direct_llm.get("provider"),
+                            "model": direct_llm.get("model"),
+                            "tokens_used": direct_llm.get("tokens_used", 0),
+                            "source": "/api/chat/message",
+                            "domain": "non_quantum",
+                        },
+                    )
+                except Exception as e:
+                    logger.warning("Failed to persist assistant message session_id=%s error=%s", session_id, e)
+
+            return {
+                "intent": "general",
+                "reply": reply,
+                "code": code_block,
+                "session_id": session_id,
+                "metadata": {
+                    "framework_detected": "general",
+                    "framework_explicit": request.framework,
+                    "math_focus": math_focus,
+                    "detail_level": request.detail_level,
+                    "session_id": session_id,
+                    "chat_memory_enabled": memory_enabled,
+                    "session_context_loaded": bool(session_context),
+                    "cross_session_summary_loaded": bool(cross_session_context),
+                    "domain_classification": {
+                        "is_quantum_domain": False,
+                        "classifier": "scripts.quantum_regex.is_quantum_text",
+                    },
+                    "warning": non_quantum_warning,
+                    "rag_skipped": True,
+                    "rag_documents": 0,
+                    "rag_average_score": 0.0,
+                    "tokens_used": direct_llm.get("tokens_used", 0),
+                    "llm_provider": direct_llm.get("provider"),
+                    "llm_model": direct_llm.get("model"),
+                    "llm_attempt": direct_llm.get("attempt"),
+                    "llm_fallback_used": direct_llm.get("fallback_used", False),
+                    "requested_runtime": {},
+                    "runtime_requirements": {},
+                    "runtime_recommendations": {},
+                    "version_conflicts": [],
+                    "runtime_validation": {"status": "skipped_non_quantum_domain"},
+                    "rag_version": {
+                        "selected_version": "",
+                        "latest_version": "",
+                        "strategy": "",
+                    },
+                    "latency_ms": int((time.time() - start) * 1000),
+                },
+            }
+
+        runtime_bundle = await build_runtime_bundle_with_rag(
+            framework=runtime_framework,
+            client_context=request.client_context,
+            runtime_preferences=request.runtime_preferences,
+            request_source="/api/chat/message",
         )
         retrieval_query = _build_retrieval_query(
             query=query,
@@ -332,6 +463,12 @@ async def chat_message(
                 "chat_memory_enabled": memory_enabled,
                 "session_context_loaded": bool(session_context),
                 "cross_session_summary_loaded": bool(cross_session_context),
+                "domain_classification": {
+                    "is_quantum_domain": True,
+                    "classifier": "scripts.quantum_regex.is_quantum_text",
+                },
+                "warning": None,
+                "rag_skipped": False,
                 "rag_documents": len(rag_results.get("documents", [])),
                 "rag_average_score": rag_results.get("average_score", 0),
                 "tokens_used": llm.get("tokens_used", 0),

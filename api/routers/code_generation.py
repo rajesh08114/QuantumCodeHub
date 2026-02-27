@@ -17,6 +17,7 @@ from services.cache_service import cache_service
 from core.security import get_current_active_user
 from core.config import settings
 from ml.prompts import CodeGenerationPrompts, ErrorFixingPrompts
+from utils.domain_classifier import is_quantum_domain_text
 import time
 import hashlib
 import logging
@@ -80,6 +81,16 @@ async def generate_code(
     framework = (request.framework or "qiskit").strip().lower()
     
     try:
+        if not is_quantum_domain_text(request.prompt):
+            logger.warning(
+                "Non-quantum domain request blocked endpoint=/api/code/generate field=prompt preview=%s",
+                " ".join((request.prompt or "").split())[:220],
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="not quantum domain",
+            )
+
         runtime_bundle = await build_runtime_bundle_with_rag(
             framework=framework,
             client_context=request.client_context,

@@ -334,3 +334,38 @@ Response style requirements:
 4. If code is needed, include a single runnable code block.
 5. Mention compatible runtime/package versions only when code or dependency details are involved.
 """
+
+    @staticmethod
+    def build_non_quantum_advanced_prompt(
+        user_question: str,
+        detail_level: str = "advanced",
+        conversation_context: str = "",
+        cross_session_summary: str = "",
+    ) -> str:
+        memory_block = ""
+        if (conversation_context or "").strip():
+            memory_block += f"\nCurrent session memory:\n{conversation_context}\n"
+        if (cross_session_summary or "").strip():
+            memory_block += f"\nOther session summaries:\n{cross_session_summary}\n"
+
+        requested_level = (detail_level or "advanced").strip().lower()
+        if requested_level not in {"beginner", "intermediate", "advanced"}:
+            requested_level = "advanced"
+
+        return f"""You are a senior technical expert and research-grade assistant.
+The user query is outside the quantum-computing domain, so answer directly without quantum assumptions.
+Provide an advanced, precise response tailored to the user's exact request.
+
+Requested detail level: {requested_level} (target depth should remain advanced quality).
+User question:
+{user_question}
+{memory_block}
+
+Response requirements:
+1. Start with a direct answer in 1-3 sentences.
+2. Provide deep technical reasoning, tradeoffs, and edge cases where relevant.
+3. State assumptions clearly when context is missing.
+4. If the question is practical, include a concise action plan.
+5. If code is requested, include one clean runnable code block.
+6. Avoid filler text, avoid quantum-specific framing, and keep claims accurate.
+"""

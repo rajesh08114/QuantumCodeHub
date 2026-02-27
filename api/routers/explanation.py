@@ -13,6 +13,7 @@ from services.runtime_compatibility import build_runtime_bundle_with_rag
 from ml.prompts import ExplanationPrompts
 from core.config import settings
 from core.security import get_current_active_user
+from utils.domain_classifier import is_quantum_domain_text
 from utils.explanation_parser import parse_explanation, extract_mathematics
 import logging
 
@@ -79,6 +80,12 @@ async def explain_code(
                 status_code=400,
                 detail=f"Invalid framework. Must be one of: {sorted(VALID_FRAMEWORKS)}",
             )
+        if not is_quantum_domain_text(request.code):
+            logger.warning(
+                "Non-quantum domain request blocked endpoint=/api/explain/code field=code preview=%s",
+                " ".join((request.code or "").split())[:220],
+            )
+            raise HTTPException(status_code=400, detail="not quantum domain")
 
         runtime_bundle = await build_runtime_bundle_with_rag(
             framework=framework,

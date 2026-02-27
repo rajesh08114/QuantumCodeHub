@@ -19,6 +19,7 @@ from services.runtime_compatibility import build_runtime_bundle_with_rag
 from services.validator_service import validator_service
 from services.modernization_service import modernization_service
 from schemas.common import ClientContext, RuntimePreferences
+from utils.domain_classifier import is_quantum_domain_text
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/fix", tags=["Error Fixing"])
@@ -147,12 +148,6 @@ async def fix_code(
 
     try:
         framework = (request.framework or "").strip().lower()
-        runtime_bundle = await build_runtime_bundle_with_rag(
-            framework=framework,
-            client_context=request.client_context,
-            runtime_preferences=request.runtime_preferences,
-            request_source="/api/fix/code",
-        )
         source_code = (request.code or "").strip()
         error_message = (request.error_message or "").strip() or None
 
@@ -163,6 +158,19 @@ async def fix_code(
                 status_code=400,
                 detail=f"Invalid framework. Must be one of: {sorted(VALID_FRAMEWORKS)}",
             )
+        if not is_quantum_domain_text(f"{source_code}\n{error_message or ''}"):
+            logger.warning(
+                "Non-quantum domain request blocked endpoint=/api/fix/code field=code preview=%s",
+                " ".join(source_code.split())[:220],
+            )
+            raise HTTPException(status_code=400, detail="not quantum domain")
+
+        runtime_bundle = await build_runtime_bundle_with_rag(
+            framework=framework,
+            client_context=request.client_context,
+            runtime_preferences=request.runtime_preferences,
+            request_source="/api/fix/code",
+        )
 
         logger.info(
             "Fix request received framework=%s error_message_present=%s code_preview=%s",
