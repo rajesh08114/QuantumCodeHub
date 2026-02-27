@@ -1,3 +1,0 @@
-"""
-Request tracking models.
-"""

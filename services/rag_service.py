@@ -1143,7 +1143,30 @@ class RAGService:
             if version_filter.get("where"):
                 query_kwargs["where"] = version_filter["where"]
 
-            result = collection.query(**query_kwargs)
+            query_failed_with_version_filter = False
+            post_filter_selected_version = ""
+            try:
+                result = collection.query(**query_kwargs)
+            except Exception as query_error:
+                if version_filter.get("where"):
+                    query_failed_with_version_filter = True
+                    post_filter_selected_version = str(version_filter.get("selected_version") or "")
+                    logger.warning(
+                        "RAG version-filter query failed source=%s framework=%s selected_version=%s; "
+                        "retrying unfiltered with post-filter. error=%s",
+                        request_source,
+                        framework,
+                        post_filter_selected_version,
+                        query_error,
+                    )
+                    fallback_kwargs = {
+                        "query_embeddings": query_vectors,
+                        "n_results": fetch_limit,
+                        "include": ["documents", "metadatas", "distances"],
+                    }
+                    result = collection.query(**fallback_kwargs)
+                else:
+                    raise
 
             raw_docs_by_query = result.get("documents") or []
             if version_filter.get("where") and not any(raw_docs_by_query):
@@ -1221,6 +1244,13 @@ class RAGService:
 
                 for rank, (content, metadata, distance) in enumerate(zip(raw_docs, raw_metas, raw_dists), start=1):
                     metadata = self._normalize_metadata(metadata, requested_framework=framework)
+                    if query_failed_with_version_filter and post_filter_selected_version:
+                        doc_framework = self._normalize_framework_name(str(metadata.get("framework", "")))
+                        doc_version = str(metadata.get("version", "")).strip()
+                        if doc_framework != self._normalize_framework_name(framework):
+                            continue
+                        if doc_version != post_filter_selected_version:
+                            continue
                     safe_content = content or ""
                     doc_id = self._doc_id(safe_content, metadata)
                     semantic_score = self._distance_to_similarity(distance)

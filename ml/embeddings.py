@@ -5,13 +5,14 @@ from sentence_transformers import SentenceTransformer
 import numpy as np
 from typing import List, Union
 import logging
+from core.config import settings
 
 logger = logging.getLogger(__name__)
 
 class EmbeddingService:
     """Service for generating text embeddings"""
     
-    def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
+    def __init__(self, model_name: str = ""):
         """
         Initialize embedding model
         
@@ -19,6 +20,7 @@ class EmbeddingService:
             model_name: HuggingFace model identifier
         """
         try:
+            model_name = (model_name or settings.EMBEDDING_MODEL or "sentence-transformers/all-MiniLM-L6-v2").strip()
             self.model = SentenceTransformer(model_name)
             self.dimension = self.model.get_sentence_embedding_dimension()
             logger.info(f"Loaded embedding model: {model_name} (dim={self.dimension})")

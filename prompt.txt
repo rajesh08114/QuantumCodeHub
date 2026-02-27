@@ -1,0 +1,11 @@
+understand whole project frontend:quantum-ai, backend:QuantumCodeHub
+
+It should be like a agent flow mentioned below.
+
+If user used to use .py file then agent should check the file related to quantum or not, if qunatum go to rag then agent(llm), if not quantum direct llm.
+
+If it is not .py file then directly trigger the llm agent.
+
+Even for non quantum context it should capable of conversion(ex: jsx->tsx & tsx->jsx) the file extension should also change, and suggetions, fix with ai, explanation, inline suggetion these are can also called as different agents for these.
+
+Should handle all the edge cases and test cases.
