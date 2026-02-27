@@ -90,3 +90,6 @@ scripts/backfill_chroma_metadata.py
 
 
 Rag_pipeline/chroma_docs
+# Ignore Chroma DB
+New_Rag/chroma_db_bge_base_en_v1_5/
+
