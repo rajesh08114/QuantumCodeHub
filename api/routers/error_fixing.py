@@ -153,17 +153,70 @@ async def fix_code(
 
         if not source_code:
             raise HTTPException(status_code=400, detail="code is required")
-        if framework not in VALID_FRAMEWORKS:
+        if framework and framework not in VALID_FRAMEWORKS:
             raise HTTPException(
                 status_code=400,
                 detail=f"Invalid framework. Must be one of: {sorted(VALID_FRAMEWORKS)}",
             )
-        if not is_quantum_domain_text(f"{source_code}\n{error_message or ''}"):
-            logger.warning(
-                "Non-quantum domain request blocked endpoint=/api/fix/code field=code preview=%s",
-                " ".join(source_code.split())[:220],
+        if not framework:
+            framework = "qiskit"
+        is_quantum = is_quantum_domain_text(f"{source_code}\n{error_message or ''}")
+        if not is_quantum:
+            prompt = (
+                "Fix the following code with minimal, correct changes. Return runnable code only.\n\n"
+                f"Code:\n```text\n{source_code}\n```\n"
+                f"Error:\n{error_message or 'No explicit traceback provided.'}"
             )
-            raise HTTPException(status_code=400, detail="not quantum domain")
+            llm_response = await llm_service.generate_code(
+                prompt=prompt,
+                max_tokens=settings.ERROR_FIXING_MAX_TOKENS,
+                temperature=0.15,
+            )
+            fixed_code = _extract_code_response(llm_response.get("generated_text", "")) or source_code
+            return {
+                "fixed_code": fixed_code,
+                "issues_identified": [],
+                "explanation": (
+                    "Applied direct LLM fix path for non-quantum context."
+                    if request.include_explanation
+                    else None
+                ),
+                "metadata": {
+                    "framework": "generic",
+                    "rag_documents": 0,
+                    "rag_average_score": 0,
+                    "tokens_used": llm_response.get("tokens_used", 0),
+                    "llm_provider": llm_response.get("provider"),
+                    "llm_model": llm_response.get("model"),
+                    "llm_attempt": llm_response.get("attempt"),
+                    "llm_fallback_used": llm_response.get("fallback_used", False),
+                    "validation_passed": True,
+                    "validation_errors": [],
+                    "validation_warnings": [],
+                    "validation_evaluation": {},
+                    "modernization_attempted": False,
+                    "modernization_applied": False,
+                    "modernization_reason": "skipped_non_quantum_domain",
+                    "modernization_before_deprecations": 0,
+                    "modernization_after_deprecations": 0,
+                    "modernization_llm_provider": None,
+                    "modernization_llm_model": None,
+                    "modernization_tokens_used": 0,
+                    "latency_ms": int((time.time() - start) * 1000),
+                    "client_type": "unknown",
+                    "client_context": {},
+                    "requested_runtime": {},
+                    "runtime_requirements": {},
+                    "runtime_recommendations": {},
+                    "version_conflicts": [],
+                    "runtime_validation": {"status": "skipped_non_quantum_domain"},
+                    "rag_version": {
+                        "selected_version": "",
+                        "latest_version": "",
+                        "strategy": "",
+                    },
+                },
+            }
 
         runtime_bundle = await build_runtime_bundle_with_rag(
             framework=framework,

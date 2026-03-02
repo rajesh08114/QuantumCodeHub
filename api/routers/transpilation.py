@@ -7,6 +7,7 @@ from typing import List, Optional
 
 from schemas.common import ClientContext, RuntimePreferences
 from services.transpiler_service import transpiler_service
+from services.llm_service import llm_service
 from services.cache_service import cache_service
 from services.validator_service import validator_service
 from services.modernization_service import modernization_service
@@ -22,6 +23,7 @@ import re
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/transpile", tags=["Transpilation"])
+NON_QUANTUM_CONVERSIONS = {("jsx", "tsx"), ("tsx", "jsx")}
 
 class TranspilationRequest(BaseModel):
     source_code: str = Field(..., description="Source code to transpile")
@@ -91,12 +93,63 @@ async def transpile_code(
             raise HTTPException(status_code=400, detail="target_framework is required")
         if source_framework == target_framework:
             raise HTTPException(400, "source_framework and target_framework must be different")
-        if not is_quantum_domain_text(source_code):
-            logger.warning(
-                "Non-quantum domain request blocked endpoint=/api/transpile/convert field=source_code preview=%s",
-                " ".join(source_code.split())[:220],
+        is_quantum = is_quantum_domain_text(source_code)
+        if not is_quantum:
+            if (source_framework, target_framework) not in NON_QUANTUM_CONVERSIONS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Non-quantum conversion supports only jsx<->tsx. "
+                        f"Requested: {source_framework}->{target_framework}"
+                    ),
+                )
+            conversion_prompt = (
+                f"Convert this {source_framework.upper()} code to {target_framework.upper()}.\n"
+                "Preserve behavior, props, types, and exports. Return code only.\n\n"
+                f"```{source_framework}\n{source_code}\n```"
             )
-            raise HTTPException(status_code=400, detail="not quantum domain")
+            llm_response = await llm_service.generate_code(
+                prompt=conversion_prompt,
+                max_tokens=max(700, min(int(settings.TRANSPILATION_MAX_TOKENS or 2000), 1800)),
+                temperature=0.1,
+            )
+            converted_code = _clean_source_code(llm_response.get("generated_text", "")) or source_code
+            return {
+                "transpiled_code": converted_code,
+                "source_framework": source_framework,
+                "target_framework": target_framework,
+                "success": True,
+                "validation_passed": True,
+                "differences": [f"Converted {source_framework} to {target_framework} via direct LLM path."],
+                "warnings": [],
+                "metadata": {
+                    "latency_ms": int((time.time() - start_time) * 1000),
+                    "method": "llm_non_quantum_conversion",
+                    "tokens_used": llm_response.get("tokens_used", 0),
+                    "llm_provider": llm_response.get("provider"),
+                    "llm_model": llm_response.get("model"),
+                    "llm_attempt": llm_response.get("attempt"),
+                    "llm_fallback_used": llm_response.get("fallback_used", False),
+                    "cached": False,
+                    "validation_errors": [],
+                    "validation_evaluation": {},
+                    "modernization_attempted": False,
+                    "modernization_applied": False,
+                    "modernization_reason": "skipped_non_quantum_domain",
+                    "modernization_before_deprecations": 0,
+                    "modernization_after_deprecations": 0,
+                    "modernization_llm_provider": None,
+                    "modernization_llm_model": None,
+                    "modernization_tokens_used": 0,
+                    "client_type": "unknown",
+                    "client_context": {},
+                    "requested_runtime": {},
+                    "runtime_requirements": {},
+                    "runtime_recommendations": [],
+                    "version_conflicts": [],
+                    "runtime_validation": {"status": "skipped_non_quantum_domain"},
+                },
+            }
 
         runtime_bundle = await build_runtime_bundle_with_rag(
             framework=target_framework,
@@ -238,5 +291,7 @@ async def get_supported_conversions():
             {"from": "qiskit", "to": "torchquantum", "status": "beta"},
             {"from": "pennylane", "to": "torchquantum", "status": "beta"},
             {"from": "cirq", "to": "torchquantum", "status": "beta"},
+            {"from": "jsx", "to": "tsx", "status": "stable"},
+            {"from": "tsx", "to": "jsx", "status": "stable"},
         ]
     }

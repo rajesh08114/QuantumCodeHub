@@ -71,12 +71,53 @@ async def get_completions(
 
         if not code_prefix:
             raise HTTPException(status_code=400, detail="code_prefix is required")
-        if not is_quantum_domain_text(code_prefix):
-            logger.warning(
-                "Non-quantum domain request blocked endpoint=/api/complete/suggest field=code_prefix preview=%s",
-                " ".join(code_prefix.split())[:220],
+        is_quantum = is_quantum_domain_text(code_prefix)
+        if not is_quantum:
+            prompt = (
+                "Provide practical code completion candidates for the cursor location.\n"
+                "Return each candidate as: <completion code> - <short description>\n"
+                f"Return up to {max(1, min(request.max_suggestions, 10))} suggestions.\n\n"
+                f"Code prefix:\n```text\n{code_prefix}\n```"
             )
-            raise HTTPException(status_code=400, detail="not quantum domain")
+            llm_response = await llm_service.generate_code(
+                prompt=prompt,
+                max_tokens=settings.COMPLETION_MAX_TOKENS,
+                temperature=0.45,
+            )
+            suggestions = parse_completion_suggestions(
+                llm_response.get("generated_text", ""),
+                max_suggestions=max(1, min(request.max_suggestions, 10)),
+            )
+            if not suggestions:
+                suggestions = [
+                    CompletionSuggestion(
+                        code="",
+                        description="No structured suggestions parsed from model output.",
+                        priority=1,
+                        confidence=0.5,
+                    )
+                ]
+            return {
+                "suggestions": suggestions,
+                "context_detected": {
+                    "scope": "generic",
+                    "framework": framework,
+                },
+                "latency_ms": int((time.time() - start_time) * 1000),
+                "metadata": {
+                    "tokens_used": llm_response.get("tokens_used", 0),
+                    "llm_provider": llm_response.get("provider"),
+                    "llm_model": llm_response.get("model"),
+                    "llm_attempt": llm_response.get("attempt"),
+                    "llm_fallback_used": llm_response.get("fallback_used", False),
+                    "runtime_validation": {"status": "skipped_non_quantum_domain"},
+                    "rag_version": {
+                        "selected_version": "",
+                        "latest_version": "",
+                        "strategy": "",
+                    },
+                },
+            }
 
         runtime_bundle = await build_runtime_bundle_with_rag(
             framework=framework,

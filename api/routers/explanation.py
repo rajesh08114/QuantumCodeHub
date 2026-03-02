@@ -75,17 +75,40 @@ async def explain_code(
     """
     try:
         framework = (request.framework or "").strip().lower()
-        if framework not in VALID_FRAMEWORKS:
+        if framework and framework not in VALID_FRAMEWORKS:
             raise HTTPException(
                 status_code=400,
                 detail=f"Invalid framework. Must be one of: {sorted(VALID_FRAMEWORKS)}",
             )
-        if not is_quantum_domain_text(request.code):
-            logger.warning(
-                "Non-quantum domain request blocked endpoint=/api/explain/code field=code preview=%s",
-                " ".join((request.code or "").split())[:220],
+        if not framework:
+            framework = "qiskit"
+        is_quantum = is_quantum_domain_text(request.code)
+        if not is_quantum:
+            prompt = (
+                "Explain the following code clearly. Focus on logic, structure, potential issues, and best practices. "
+                "If relevant, include concise math in LaTeX.\n\n"
+                f"Code:\n```text\n{request.code}\n```"
             )
-            raise HTTPException(status_code=400, detail="not quantum domain")
+            llm_response = await llm_service.generate_code(
+                prompt=prompt,
+                max_tokens=settings.EXPLANATION_MAX_TOKENS,
+                temperature=0.35,
+            )
+            text = (llm_response.get("generated_text") or "").strip()
+            if not text:
+                text = "No explanation generated."
+            return {
+                "overview": text,
+                "gate_breakdown": "N/A (non-quantum context)",
+                "quantum_concepts": "N/A (non-quantum context)",
+                "mathematics": extract_mathematics(text) if request.include_math else None,
+                "applications": "General software engineering guidance applied.",
+                "visualization": None,
+                "requested_runtime": {},
+                "runtime_requirements": {},
+                "runtime_recommendations": {},
+                "runtime_validation": {"status": "skipped_non_quantum_domain"},
+            }
 
         runtime_bundle = await build_runtime_bundle_with_rag(
             framework=framework,
@@ -170,7 +193,8 @@ async def explain_code(
         
         return explanation
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception(f"Explanation error: {e}")
         raise HTTPException(500, f"Explanation generation failed: {str(e)}")
-

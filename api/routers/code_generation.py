@@ -82,14 +82,75 @@ async def generate_code(
     
     try:
         if not is_quantum_domain_text(request.prompt):
-            logger.warning(
-                "Non-quantum domain request blocked endpoint=/api/code/generate field=prompt preview=%s",
+            logger.info(
+                "Non-quantum direct generation path endpoint=/api/code/generate framework=%s preview=%s",
+                framework,
                 " ".join((request.prompt or "").split())[:220],
             )
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="not quantum domain",
+            direct_prompt = (
+                "Generate high-quality code for the user request. "
+                "Return runnable code and keep comments concise.\n\n"
+                f"User request:\n{request.prompt}"
             )
+            direct_llm = await llm_service.generate_code(
+                prompt=direct_prompt,
+                max_tokens=_resolve_generation_max_tokens(
+                    include_explanation=request.include_explanation
+                ),
+                temperature=0.2,
+            )
+            generated_text = direct_llm.get("generated_text", "")
+            code = extract_code_from_response(generated_text) or generated_text.strip()
+            explanation = extract_explanation(generated_text) if request.include_explanation else None
+            return {
+                "code": code,
+                "framework": framework or "generic",
+                "explanation": explanation,
+                "visualization": None,
+                "confidence_score": 0.8,
+                "validation_passed": True,
+                "validation_errors": [],
+                "metadata": {
+                    "tokens_used": direct_llm.get("tokens_used", 0),
+                    "llm_provider": direct_llm.get("provider"),
+                    "llm_model": direct_llm.get("model"),
+                    "llm_attempt": direct_llm.get("attempt"),
+                    "llm_fallback_used": direct_llm.get("fallback_used", False),
+                    "rag_documents": 0,
+                    "latency_ms": int((time.time() - start_time) * 1000),
+                    "cached": False,
+                    "auto_repair_used": False,
+                    "auto_repair_attempted": False,
+                    "initial_validation_errors": [],
+                    "validation_warnings": [],
+                    "validation_evaluation": {},
+                    "modernization_attempted": False,
+                    "modernization_applied": False,
+                    "modernization_reason": "skipped_non_quantum_domain",
+                    "modernization_before_deprecations": 0,
+                    "modernization_after_deprecations": 0,
+                    "modernization_llm_provider": None,
+                    "modernization_llm_model": None,
+                    "modernization_tokens_used": 0,
+                    "generation_max_tokens": _resolve_generation_max_tokens(
+                        include_explanation=request.include_explanation
+                    ),
+                    "adaptive_routing_enabled": False,
+                    "adaptive_preferred_chain": [],
+                    "client_type": "unknown",
+                    "client_context": {},
+                    "requested_runtime": {},
+                    "runtime_requirements": {},
+                    "runtime_recommendations": {},
+                    "version_conflicts": [],
+                    "runtime_validation": {"status": "skipped_non_quantum_domain"},
+                    "rag_version": {
+                        "selected_version": "",
+                        "latest_version": "",
+                        "strategy": "",
+                    },
+                }
+            }
 
         runtime_bundle = await build_runtime_bundle_with_rag(
             framework=framework,
